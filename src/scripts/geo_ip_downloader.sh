@@ -3,7 +3,7 @@
 ###############################################################################
 # Universal Geo-IP List Downloader
 #
-# Backend utility for 'ip-blocker.sh'. Downloads, parses, and validates
+# Backend utility for 'ip_blocker.sh'. Downloads, parses, and validates
 # Geo-IP lists from multiple providers (ipdeny, ripe, nirsoft) using an
 # advanced, per-provider country specification syntax.
 #
@@ -14,7 +14,7 @@
 #   remove empty or unsafe entries (e.g., 0.0.0.0/0).
 # - Normalized Output: Generates standardized '.list.v4' and '.list.v6' files
 #   inside 'lists/allow/generated/v4' and 'lists/allow/generated/v6'
-#   respectively, ready for consumption by 'ip-blocker.sh' via iprange >=2.0
+#   respectively, ready for consumption by 'ip_blocker.sh' via iprange >=2.0
 #   directory loading.
 #
 # Usage:
@@ -29,8 +29,8 @@
 #   DNS_SERVERS    Custom DNS servers for early-boot resolution (e.g. "8.8.8.8 1.1.1.1")
 #
 # Author: LaboDJ
-# Version: 6.8
-# Last Updated: 2026/04/05
+# Version: 6.9
+# Last Updated: 2026/07/28
 ###############################################################################
 
 # Enable strict mode
@@ -48,10 +48,10 @@ set -Eeuo pipefail
 # Get the script's absolute directory
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 readonly SCRIPT_DIR
-readonly ALLOW_ROOT_DIR="$SCRIPT_DIR/lists/allow/generated"
+readonly ALLOW_ROOT_DIR="${SCRIPT_DIR}/lists/allow/generated"
 # Define the output directories for allowed lists
-readonly ALLOW_DIR_V4="$ALLOW_ROOT_DIR/v4"
-readonly ALLOW_DIR_V6="$ALLOW_ROOT_DIR/v6"
+readonly ALLOW_DIR_V4="${ALLOW_ROOT_DIR}/v4"
+readonly ALLOW_DIR_V6="${ALLOW_ROOT_DIR}/v6"
 # Required commands for dependency checks (base set; provider-specific added later)
 readonly REQUIRED_COMMANDS=(curl grep sed awk cut cp)
 # Max concurrent download jobs for parallel processing
@@ -79,9 +79,9 @@ declare -A RESOLVED_HOSTS_CACHE
 ###################
 #
 # NOTE (DRY): handle_error, log, die, and _resolve_hostname are intentionally
-# duplicated from ip-blocker.sh. Per the project architecture, scripts are
+# duplicated from ip_blocker.sh. Per the project architecture, scripts are
 # fully standalone with no shared library. Any changes here must be mirrored
-# in ip-blocker.sh and vice versa.
+# in ip_blocker.sh and vice versa.
 #
 
 # Generic error handler, triggered by 'trap ... ERR'.
@@ -91,11 +91,11 @@ handle_error() {
     local line_number=$1
     local i stack_trace=""
     for ((i = 1; i < ${#FUNCNAME[@]}; i++)); do
-        stack_trace+="${FUNCNAME[$i]}(L${BASH_LINENO[$((i-1))]})"
+        stack_trace+="${FUNCNAME[${i}]}(L${BASH_LINENO[$((i-1))]})"
         ((i < ${#FUNCNAME[@]} - 1)) && stack_trace+=" → "
     done
-    log "ERROR" "Script failed at line $line_number with exit code $exit_code | stack: $stack_trace"
-    exit "$exit_code"
+    log "ERROR" "Script failed at line ${line_number} with exit code ${exit_code} | stack: ${stack_trace}"
+    exit "${exit_code}"
 }
 
 # Standardized logging function.
@@ -130,9 +130,9 @@ setup_signal_handlers() {
 # Cleans up temporary resources, primarily the temp directory.
 # This function is called automatically on script EXIT.
 cleanup() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-        log "INFO" "Removed temporary directory: $TEMP_DIR"
+    if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
+        rm -rf "${TEMP_DIR}"
+        log "INFO" "Removed temporary directory: ${TEMP_DIR}"
     fi
 }
 
@@ -172,16 +172,17 @@ EOF
 parse_arguments() {
     OPTIND=1
     while getopts ":c:h" opt; do
-        case $opt in
-        c) ALLOWED_COUNTRIES_SYNTAX="$OPTARG" ;;
+        case ${opt} in
+        c) ALLOWED_COUNTRIES_SYNTAX="${OPTARG}" ;;
         h) print_usage ;;
-        \?) log "ERROR" "Invalid option: -$OPTARG"; print_usage ;;
-        :) log "ERROR" "The option -$OPTARG requires an argument"; print_usage ;;
+        \?) log "ERROR" "Invalid option: -${OPTARG}"; print_usage ;;
+        :) log "ERROR" "The option -${OPTARG} requires an argument"; print_usage ;;
+        *) log "ERROR" "Unexpected option parser state"; print_usage ;;
         esac
     done
 
     # The -c (countries) option is non-negotiable.
-    if [[ -z "$ALLOWED_COUNTRIES_SYNTAX" ]]; then
+    if [[ -z "${ALLOWED_COUNTRIES_SYNTAX}" ]]; then
         log "ERROR" "Country/Provider syntax (-c) is mandatory."
         print_usage
     fi
@@ -192,10 +193,10 @@ normalize_and_validate_country_syntax() {
     ALLOWED_COUNTRIES_SYNTAX="${ALLOWED_COUNTRIES_SYNTAX//[[:space:]]/}"
     ALLOWED_COUNTRIES_SYNTAX="${ALLOWED_COUNTRIES_SYNTAX%%;}"
 
-    [[ -n "$ALLOWED_COUNTRIES_SYNTAX" ]] || die "Country/Provider syntax (-c) is mandatory."
+    [[ -n "${ALLOWED_COUNTRIES_SYNTAX}" ]] || die "Country/Provider syntax (-c) is mandatory."
 
     local syntax_regex='^[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*(;[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*)*$'
-    [[ "$ALLOWED_COUNTRIES_SYNTAX" =~ $syntax_regex ]] \
+    [[ "${ALLOWED_COUNTRIES_SYNTAX}" =~ ${syntax_regex} ]] \
         || die "Invalid syntax. Use 'provider:CC,CC;provider2:CC' (example: 'ripe:IT,FR;ipdeny:CN')."
 }
 
@@ -216,7 +217,7 @@ check_dependencies() {
     fi
 
     for cmd in "${all_commands[@]}"; do
-        command -v "$cmd" >/dev/null 2>&1 || missing_commands+=("$cmd")
+        command -v "${cmd}" >/dev/null 2>&1 || missing_commands+=("${cmd}")
     done
 
     # Specifically check if awk has the log() function, which is
@@ -230,10 +231,10 @@ check_dependencies() {
 
 normalize_runtime_flags() {
     REQUIRE_IPV6_LISTS="${REQUIRE_IPV6_LISTS,,}"
-    case "$REQUIRE_IPV6_LISTS" in
+    case "${REQUIRE_IPV6_LISTS}" in
     true|false) ;;
     *)
-        die "Invalid GEOIP_REQUIRE_IPV6 value '$REQUIRE_IPV6_LISTS'. Allowed: true|false"
+        die "Invalid GEOIP_REQUIRE_IPV6 value '${REQUIRE_IPV6_LISTS}'. Allowed: true|false"
         ;;
     esac
 }
@@ -241,7 +242,7 @@ normalize_runtime_flags() {
 # Logs the current DNS configuration for early-boot stability.
 log_dns_config() {
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        log "INFO" "Custom DNS resolution active (Servers: $DNS_SERVERS)"
+        log "INFO" "Custom DNS resolution active (Servers: ${DNS_SERVERS})"
     else
         log "INFO" "Custom DNS resolution disabled (using system resolver)"
     fi
@@ -255,7 +256,7 @@ _resolve_hostname() {
     local host="$1"
     [[ -z "${DNS_SERVERS:-}" ]] && return 0
     # Return from cache if available
-    [[ -n "${RESOLVED_HOSTS_CACHE[$host]:-}" ]] && { echo "${RESOLVED_HOSTS_CACHE[$host]}"; return 0; }
+    [[ -n "${RESOLVED_HOSTS_CACHE[${host}]:-}" ]] && { echo "${RESOLVED_HOSTS_CACHE[${host}]}"; return 0; }
 
     local -a ips=()
     local -a servers=()
@@ -270,14 +271,14 @@ _resolve_hostname() {
     # Try each DNS server until one succeeds
     for ns in "${servers[@]}"; do
         for rrtype in "${rrtypes[@]}"; do
-            mapfile -t resolved < <(dig +short "@$ns" "$host" "$rrtype" 2>/dev/null || true)
+            mapfile -t resolved < <(dig +short "@${ns}" "${host}" "${rrtype}" 2>/dev/null || true)
             for ip in "${resolved[@]}"; do
-                if [[ "$rrtype" == "A" ]]; then
-                    [[ "$ip" == *.*.*.* ]] || continue
+                if [[ "${rrtype}" == "A" ]]; then
+                    [[ "${ip}" == *.*.*.* ]] || continue
                 else
-                    [[ "$ip" == *:* ]] || continue
+                    [[ "${ip}" == *:* ]] || continue
                 fi
-                ips+=("$ip")
+                ips+=("${ip}")
             done
         done
         if [[ ${#ips[@]} -gt 0 ]]; then
@@ -286,7 +287,7 @@ _resolve_hostname() {
     done
 
     if [[ ${#ips[@]} -gt 0 ]]; then
-        RESOLVED_HOSTS_CACHE[$host]="${ips[*]}"
+        RESOLVED_HOSTS_CACHE[${host}]="${ips[*]}"
         echo "${ips[*]}"
     fi
 }
@@ -302,21 +303,21 @@ parse_url_endpoint() {
     endpoint="${endpoint%%#*}"
     endpoint="${endpoint##*@}"
     default_port=80
-    [[ "$url" == https://* ]] && default_port=443
+    [[ "${url}" == https://* ]] && default_port=443
 
-    URL_PARSE_HOST="$endpoint"
-    URL_PARSE_PORT="$default_port"
+    URL_PARSE_HOST="${endpoint}"
+    URL_PARSE_PORT="${default_port}"
 
-    if [[ "$endpoint" == \[*\]* ]]; then
+    if [[ "${endpoint}" == \[*\]* ]]; then
         URL_PARSE_HOST="${endpoint#\[}"
         URL_PARSE_HOST="${URL_PARSE_HOST%%]*}"
-        if [[ "$endpoint" == *]:* ]]; then
+        if [[ "${endpoint}" == *]:* ]]; then
             URL_PARSE_PORT="${endpoint##*:}"
         fi
         return 0
     fi
 
-    if [[ "$endpoint" == *:* ]]; then
+    if [[ "${endpoint}" == *:* ]]; then
         URL_PARSE_HOST="${endpoint%%:*}"
         URL_PARSE_PORT="${endpoint##*:}"
     fi
@@ -330,18 +331,20 @@ build_resolve_options_for_url() {
     local -a ips=()
     local ip
     local resolve_ip
+    local resolved_ips
 
-    [[ -n "${DNS_SERVERS:-}" ]] || { printf -v "$result_var" '%s' ""; return 0; }
+    [[ -n "${DNS_SERVERS:-}" ]] || { printf -v "${result_var}" '%s' ""; return 0; }
 
-    parse_url_endpoint "$url"
-    read -ra ips <<< "$(_resolve_hostname "$URL_PARSE_HOST")"
+    parse_url_endpoint "${url}"
+    resolved_ips=$(_resolve_hostname "${URL_PARSE_HOST}")
+    read -ra ips <<< "${resolved_ips}"
     for ip in "${ips[@]}"; do
-        resolve_ip="$ip"
-        [[ "$resolve_ip" == *:* ]] && resolve_ip="[$resolve_ip]"
-        options+=("--resolve" "$URL_PARSE_HOST:$URL_PARSE_PORT:$resolve_ip")
+        resolve_ip="${ip}"
+        [[ "${resolve_ip}" == *:* ]] && resolve_ip="[${resolve_ip}]"
+        options+=("--resolve" "${URL_PARSE_HOST}:${URL_PARSE_PORT}:${resolve_ip}")
     done
 
-    printf -v "$result_var" '%s' "${options[*]-}"
+    printf -v "${result_var}" '%s' "${options[*]-}"
 }
 
 # Cheap HTML/XML detector without spawning head/grep for every file.
@@ -354,10 +357,10 @@ file_has_markup_header() {
         line="${line,,}"
         [[ -z "${line//[[:space:]]/}" ]] && continue
         ((checked++))
-        if [[ "$line" == *'<!doctype'* || "$line" == *'<?xml'* || "$line" == *'<!--'* || "$line" == *'<html'* || "$line" == *'<head'* || "$line" == *'<body'* ]]; then
+        if [[ "${line}" == *'<!doctype'* || "${line}" == *'<?xml'* || "${line}" == *'<!--'* || "${line}" == *'<html'* || "${line}" == *'<head'* || "${line}" == *'<body'* ]]; then
             return 0
         fi
-    done < "$file"
+    done < "${file}"
 
     return 1
 }
@@ -376,25 +379,25 @@ download_file() {
 
     # 1. Handle custom DNS resolution if DNS_SERVERS is set (for early boot stability)
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        build_resolve_options_for_url "$url" resolve_opts_str
-        [[ -n "$resolve_opts_str" ]] && read -ra resolve_opts <<< "$resolve_opts_str"
+        build_resolve_options_for_url "${url}" resolve_opts_str
+        [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<< "${resolve_opts_str}"
     fi
 
     while ((retries < MAX_DOWNLOAD_RETRIES)); do
         # -sSLf: Silent, follow redirects, fail fast on server errors (4xx, 5xx)
         # --connect-timeout 10: Fail if connection is not made in 10s
         # --max-time 30: Fail if the *entire* download takes longer than 30s
-        if curl -sSLf "${resolve_opts[@]}" --connect-timeout 10 --max-time 30 "$url" -o "$temp_outfile"; then
+        if curl -sSLf "${resolve_opts[@]}" --connect-timeout 10 --max-time 30 "${url}" -o "${temp_outfile}"; then
             return 0 # Success
         fi
 
         ((retries++))
-        log "WARN" "Download failed for $url. Retry $retries/$MAX_DOWNLOAD_RETRIES..."
-        rm -f "$temp_outfile"
+        log "WARN" "Download failed for ${url}. Retry ${retries}/${MAX_DOWNLOAD_RETRIES}..."
+        rm -f "${temp_outfile}"
         sleep $((2 ** retries)) # Exponential backoff: 2s, 4s, 8s...
     done
 
-    log "ERROR" "Failed to download $url after $MAX_DOWNLOAD_RETRIES attempts."
+    log "ERROR" "Failed to download ${url} after ${MAX_DOWNLOAD_RETRIES} attempts."
     return 1 # Final failure
 }
 export -f _resolve_hostname
@@ -404,12 +407,14 @@ export -f download_file
 #   0 => valid
 #   1 => invalid / mixed / empty
 #   2 => dangerous catch-all entry
+# This function is a predicate and checks each fallible operation explicitly.
+# shellcheck disable=SC2310
 validate_generated_list_file() {
     local list_file="$1"
     local validation_rc=0
 
-    [[ -s "$list_file" ]] || return 1
-    file_has_markup_header "$list_file" && return 1
+    [[ -s "${list_file}" ]] || return 1
+    file_has_markup_header "${list_file}" && return 1
 
     if awk '
         function is_valid_cidr(prefix, maxbits) {
@@ -509,13 +514,13 @@ validate_generated_list_file() {
             if (dangerous) exit 2
             if (!saw_data || invalid || valid == 0) exit 1
         }
-    ' "$list_file"; then
+    ' "${list_file}"; then
         :
     else
         validation_rc=$?
     fi
 
-    return "$validation_rc"
+    return "${validation_rc}"
 }
 
 # Validates a generated IP list before moving it to the final destination.
@@ -523,24 +528,26 @@ validate_generated_list_file() {
 # @param $1 The path to the temporary, processed file
 # @param $2 The final destination file path
 # @param $3 A human-readable name for logging (e.g., "IPv4 (IT)")
+# Validation status selects publish or rejection paths.
+# shellcheck disable=SC2310
 validate_and_move_generated_file() {
     local temp_file="$1"
     local final_file="$2"
     local list_name="$3"
     local validation_rc=0
 
-    if validate_generated_list_file "$temp_file"; then
-        mv "$temp_file" "$final_file"
-        log "INFO" "Successfully processed generated $list_name list."
+    if validate_generated_list_file "${temp_file}"; then
+        mv "${temp_file}" "${final_file}"
+        log "INFO" "Successfully processed generated ${list_name} list."
         return
     fi
     validation_rc=$?
 
-    case $validation_rc in
-    2) log "ERROR" "DANGEROUS entry found in generated $list_name list. DISCARDING." ;;
-    *) log "WARN" "Generated $list_name list contains invalid, empty, or mixed content. Ignoring." ;;
+    case ${validation_rc} in
+    2) log "ERROR" "DANGEROUS entry found in generated ${list_name} list. DISCARDING." ;;
+    *) log "WARN" "Generated ${list_name} list contains invalid, empty, or mixed content. Ignoring." ;;
     esac
-    rm -f "$temp_file"
+    rm -f "${temp_file}"
 }
 export -f validate_and_move_generated_file
 
@@ -549,66 +556,68 @@ cached_generated_list_is_valid() {
     local cached_file="$1"
     local list_basename="$2"
 
-    [[ -f "$cached_file" ]] || return 1
+    [[ -f "${cached_file}" ]] || return 1
 
     # Nirsoft has no IPv6 dataset by design; the empty placeholder is the valid cache.
-    if [[ "$list_basename" == *.nirsoft.list.v6 ]]; then
-        [[ ! -s "$cached_file" ]]
+    if [[ "${list_basename}" == *.nirsoft.list.v6 ]]; then
+        [[ ! -s "${cached_file}" ]]
         return
     fi
 
-    validate_generated_list_file "$cached_file"
+    validate_generated_list_file "${cached_file}"
 }
 
 # Restores missing staged lists from the previous successful cache, list by list.
 # If the exact old list does not exist, the caller will fail-safe before swapping.
+# Cached-list validation is intentionally used as a predicate.
+# shellcheck disable=SC2310
 restore_missing_expected_lists() {
     local family="$1"
     shift
 
     local staging_dir allow_dir staging_file cached_file basename
-    case "$family" in
+    case "${family}" in
     v4)
-        staging_dir="$STAGING_V4"
-        allow_dir="$ALLOW_DIR_V4"
+        staging_dir="${STAGING_V4}"
+        allow_dir="${ALLOW_DIR_V4}"
         ;;
     v6)
-        staging_dir="$STAGING_V6"
-        allow_dir="$ALLOW_DIR_V6"
+        staging_dir="${STAGING_V6}"
+        allow_dir="${ALLOW_DIR_V6}"
         ;;
     *)
-        die "Invalid list family for fallback restore: $family"
+        die "Invalid list family for fallback restore: ${family}"
         ;;
     esac
 
     for basename in "$@"; do
-        staging_file="$staging_dir/$basename"
-        [[ -f "$staging_file" ]] && continue
+        staging_file="${staging_dir}/${basename}"
+        [[ -f "${staging_file}" ]] && continue
 
-        if [[ "$basename" == *.nirsoft.list.v6 ]]; then
-            if [[ "$REQUIRE_IPV6_LISTS" == "true" ]]; then
-                MISSING_EXPECTED_FILES+=("$family:$basename")
+        if [[ "${basename}" == *.nirsoft.list.v6 ]]; then
+            if [[ "${REQUIRE_IPV6_LISTS}" == "true" ]]; then
+                MISSING_EXPECTED_FILES+=("${family}:${basename}")
             else
-                : > "$staging_file"
-                log "INFO" "Created empty IPv6 placeholder for Nirsoft list: $basename"
+                : > "${staging_file}"
+                log "INFO" "Created empty IPv6 placeholder for Nirsoft list: ${basename}"
             fi
             continue
         fi
 
-        if [[ "$family" == "v6" && "$REQUIRE_IPV6_LISTS" != "true" ]]; then
-            : > "$staging_file"
-            log "WARN" "IPv6 list unavailable but optional for this run. Using empty placeholder: $basename"
+        if [[ "${family}" == "v6" && "${REQUIRE_IPV6_LISTS}" != "true" ]]; then
+            : > "${staging_file}"
+            log "WARN" "IPv6 list unavailable but optional for this run. Using empty placeholder: ${basename}"
             continue
         fi
 
-        cached_file="$allow_dir/$basename"
-        if cached_generated_list_is_valid "$cached_file" "$basename"; then
-            cp -f -- "$cached_file" "$staging_file" || die "Failed to restore cached list '$basename'"
-            log "WARN" "Using cached allowlist for unavailable source: $basename"
+        cached_file="${allow_dir}/${basename}"
+        if cached_generated_list_is_valid "${cached_file}" "${basename}"; then
+            cp -f -- "${cached_file}" "${staging_file}" || die "Failed to restore cached list '${basename}'"
+            log "WARN" "Using cached allowlist for unavailable source: ${basename}"
             continue
         fi
 
-        MISSING_EXPECTED_FILES+=("$family:$basename")
+        MISSING_EXPECTED_FILES+=("${family}:${basename}")
     done
 }
 
@@ -619,23 +628,23 @@ atomic_swap_directory() {
     local backup_dir="$3"
     local parent_dir="${target_dir%/*}"
 
-    [[ -d "$new_dir" ]] || die "Atomic swap source directory not found: $new_dir"
-    [[ "$parent_dir" == "$target_dir" ]] || mkdir -p "$parent_dir"
+    [[ -d "${new_dir}" ]] || die "Atomic swap source directory not found: ${new_dir}"
+    [[ "${parent_dir}" == "${target_dir}" ]] || mkdir -p "${parent_dir}"
 
-    if [[ -d "$target_dir" ]]; then
-        mv "$target_dir" "$backup_dir" || die "Failed to move existing directory '$target_dir' to backup"
+    if [[ -d "${target_dir}" ]]; then
+        mv "${target_dir}" "${backup_dir}" || die "Failed to move existing directory '${target_dir}' to backup"
     fi
 
-    if mv "$new_dir" "$target_dir"; then
-        rm -rf "$backup_dir"
+    if mv "${new_dir}" "${target_dir}"; then
+        rm -rf "${backup_dir}"
         return 0
     fi
 
-    log "ERROR" "Failed to activate new directory '$target_dir'. Attempting rollback."
-    if [[ -d "$backup_dir" ]]; then
-        mv "$backup_dir" "$target_dir" || log "ERROR" "Rollback failed for '$target_dir'"
+    log "ERROR" "Failed to activate new directory '${target_dir}'. Attempting rollback."
+    if [[ -d "${backup_dir}" ]]; then
+        mv "${backup_dir}" "${target_dir}" || log "ERROR" "Rollback failed for '${target_dir}'"
     fi
-    die "Atomic directory swap failed for '$target_dir'"
+    die "Atomic directory swap failed for '${target_dir}'"
 }
 
 
@@ -643,16 +652,18 @@ atomic_swap_directory() {
 # @param $1 The URL to download
 # @param $2 The final output file path
 # @param $3 A human-readable name for logging
+# Download status selects the logged skip path.
+# shellcheck disable=SC2310
 download_and_validate_simple() {
     local url="$1"
     local outfile="$2"
     local proto_name="$3" # e.g., "IPv4 (IT)"
-    local temp_outfile="$outfile.tmp"
+    local temp_outfile="${outfile}.tmp"
 
-    log "INFO" "Downloading $proto_name list from $url"
+    log "INFO" "Downloading ${proto_name} list from ${url}"
 
-    if ! download_file "$url" "$temp_outfile"; then
-        log "WARN" "Failed to download $proto_name list. Skipping."
+    if ! download_file "${url}" "${temp_outfile}"; then
+        log "WARN" "Failed to download ${proto_name} list. Skipping."
         return
     fi
 
@@ -664,10 +675,10 @@ download_and_validate_simple() {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
             if ($0 != "") print
         }
-    ' "$temp_outfile" > "${temp_outfile}.cleaned" || die "Failed to normalize $proto_name list"
-    mv -f -- "${temp_outfile}.cleaned" "$temp_outfile" || die "Failed to finalize normalized $proto_name list"
+    ' "${temp_outfile}" > "${temp_outfile}.cleaned" || die "Failed to normalize ${proto_name} list"
+    mv -f -- "${temp_outfile}.cleaned" "${temp_outfile}" || die "Failed to finalize normalized ${proto_name} list"
 
-    validate_and_move_generated_file "$temp_outfile" "$outfile" "$proto_name"
+    validate_and_move_generated_file "${temp_outfile}" "${outfile}" "${proto_name}"
 }
 export -f download_and_validate_simple
 
@@ -679,7 +690,7 @@ wait_for_job_slot() {
     # returns a non-zero status (e.g., if a job failed), allowing
     # the script to continue processing other jobs.
     while :; do
-        mapfile -t running_jobs < <(jobs -pr)
+        mapfile -t running_jobs < <(jobs -pr || true)
         ((${#running_jobs[@]} < MAX_DOWNLOAD_JOBS)) && return 0
         wait -n || true
     done
@@ -696,13 +707,13 @@ _download_country_ipdeny() {
     local code="$1"
     local code_lower="${code,,}"
 
-    local V4_URL="https://www.ipdeny.com/ipblocks/data/aggregated/$code_lower-aggregated.zone"
-    local V4_OUT_FILE="$STAGING_V4/$code_lower.ipdeny.list.v4"
-    download_and_validate_simple "$V4_URL" "$V4_OUT_FILE" "IPv4 ($code)"
+    local V4_URL="https://www.ipdeny.com/ipblocks/data/aggregated/${code_lower}-aggregated.zone"
+    local V4_OUT_FILE="${STAGING_V4}/${code_lower}.ipdeny.list.v4"
+    download_and_validate_simple "${V4_URL}" "${V4_OUT_FILE}" "IPv4 (${code})"
 
-    local V6_URL="https://www.ipdeny.com/ipv6/ipaddresses/aggregated/$code_lower-aggregated.zone"
-    local V6_OUT_FILE="$STAGING_V6/$code_lower.ipdeny.list.v6"
-    download_and_validate_simple "$V6_URL" "$V6_OUT_FILE" "IPv6 ($code)"
+    local V6_URL="https://www.ipdeny.com/ipv6/ipaddresses/aggregated/${code_lower}-aggregated.zone"
+    local V6_OUT_FILE="${STAGING_V6}/${code_lower}.ipdeny.list.v6"
+    download_and_validate_simple "${V6_URL}" "${V6_OUT_FILE}" "IPv6 (${code})"
 }
 export -f _download_country_ipdeny
 
@@ -714,7 +725,7 @@ download_provider_ipdeny() {
     for code in "${countries[@]}"; do
         wait_for_job_slot
         # Launch the download in the background
-        _download_country_ipdeny "$code" &
+        _download_country_ipdeny "${code}" &
     done
     # Wait for all background jobs for this provider to complete
     wait
@@ -727,6 +738,8 @@ download_provider_ipdeny() {
 
 # Main function for the 'RIPE' provider.
 # @param $@ A list of country codes (e.g., "IT" "FR" "DE")
+# Provider downloads return checked status for fallback handling.
+# shellcheck disable=SC2310
 download_provider_ripe() {
     local -a ripe_countries=("$@")
     if [[ ${#ripe_countries[@]} -eq 0 ]]; then
@@ -736,21 +749,21 @@ download_provider_ripe() {
 
     local -r RIPE_URL="https://ftp.ripe.net/pub/stats/ripencc"
     local -r RIPE_FILE="delegated-ripencc-latest"
-    local ripe_data_file="$TEMP_DIR/$RIPE_FILE"
-    local ripe_md5_file="$TEMP_DIR/$RIPE_FILE.md5"
+    local ripe_data_file="${TEMP_DIR}/${RIPE_FILE}"
+    local ripe_md5_file="${TEMP_DIR}/${RIPE_FILE}.md5"
 
     log "INFO" "Using provider: RIPE (Supports IPv4 and IPv6) for ${ripe_countries[*]}"
 
     # 1. Download the database and its checksum (only if not already downloaded)
-    if [[ ! -f "$ripe_data_file" ]]; then
+    if [[ ! -f "${ripe_data_file}" ]]; then
         log "INFO" "Downloading RIPE data file..."
-        if ! download_file "$RIPE_URL/$RIPE_FILE" "$ripe_data_file"; then
+        if ! download_file "${RIPE_URL}/${RIPE_FILE}" "${ripe_data_file}"; then
             log "WARN" "Failed to download RIPE data file. Falling back to cached per-country lists where available."
             return
         fi
         log "INFO" "Downloading RIPE MD5 file..."
-        if ! download_file "$RIPE_URL/$RIPE_FILE.md5" "$ripe_md5_file"; then
-            rm -f "$ripe_data_file"
+        if ! download_file "${RIPE_URL}/${RIPE_FILE}.md5" "${ripe_md5_file}"; then
+            rm -f "${ripe_data_file}"
             log "WARN" "Failed to download RIPE MD5 file. Falling back to cached per-country lists where available."
             return
         fi
@@ -758,19 +771,20 @@ download_provider_ripe() {
         # 2. Verify checksum
         log "INFO" "Verifying RIPE file checksum..."
         local expected_md5
-        expected_md5=$(awk '/MD5/ {print $NF}' "$ripe_md5_file") || {
-            rm -f "$ripe_data_file" "$ripe_md5_file"
+        expected_md5=$(awk '/MD5/ {print $NF}' "${ripe_md5_file}") || {
+            rm -f "${ripe_data_file}" "${ripe_md5_file}"
             log "WARN" "Failed to parse RIPE MD5 file. Falling back to cached per-country lists where available."
             return
         }
-        local computed_md5 _
-        read -r computed_md5 _ < <(md5sum "$ripe_data_file") || {
-            rm -f "$ripe_data_file" "$ripe_md5_file"
+        local computed_md5 md5_output _
+        if ! md5_output=$(md5sum "${ripe_data_file}"); then
+            rm -f "${ripe_data_file}" "${ripe_md5_file}"
             log "WARN" "Failed to compute RIPE checksum. Falling back to cached per-country lists where available."
             return
-        }
-        if [[ "$expected_md5" != "$computed_md5" ]]; then
-            rm -f "$ripe_data_file" "$ripe_md5_file"
+        fi
+        read -r computed_md5 _ <<< "${md5_output}"
+        if [[ "${expected_md5}" != "${computed_md5}" ]]; then
+            rm -f "${ripe_data_file}" "${ripe_md5_file}"
             log "WARN" "RIPE MD5 checksum mismatch. Falling back to cached per-country lists where available."
             return
         fi
@@ -791,22 +805,22 @@ download_provider_ripe() {
     for code in "${ripe_countries[@]}"; do
         local code_lower="${code,,}"
 
-        local v4_out="$STAGING_V4/$code_lower.ripe.list.v4"
-        local v6_out="$STAGING_V6/$code_lower.ripe.list.v6"
-        local temp_v4="$v4_out.tmp"
-        local temp_v6="$v6_out.tmp"
+        local v4_out="${STAGING_V4}/${code_lower}.ripe.list.v4"
+        local v6_out="${STAGING_V6}/${code_lower}.ripe.list.v6"
+        local temp_v4="${v4_out}.tmp"
+        local temp_v6="${v6_out}.tmp"
 
         # Ensure temp files are empty/exist
-        : > "$temp_v4"
-        : > "$temp_v6"
+        : > "${temp_v4}"
+        : > "${temp_v6}"
 
-        temp_v4_files[$code]="$temp_v4"
-        temp_v6_files[$code]="$temp_v6"
+        temp_v4_files[${code}]="${temp_v4}"
+        temp_v6_files[${code}]="${temp_v6}"
 
-        printf -v awk_targets '%s%s\t%s\t%s\n' "$awk_targets" "$code" "$temp_v4" "$temp_v6"
+        printf -v awk_targets '%s%s\t%s\t%s\n' "${awk_targets}" "${code}" "${temp_v4}" "${temp_v6}"
     done
 
-    export AWK_TARGETS="$awk_targets"
+    export AWK_TARGETS="${awk_targets}"
 
     # 4. Run AWK once
     # This AWK script performs a single-pass scan of the massive RIPE database.
@@ -855,22 +869,22 @@ download_provider_ripe() {
                 printf "%s/%s\n", $4, $5 >> file_map_v6[$2]
             }
         }
-    ' "$ripe_data_file"
+    ' "${ripe_data_file}"
 
     unset AWK_TARGETS
 
     # 5. Validate and move all generated files
     for code in "${ripe_countries[@]}"; do
         local code_lower="${code,,}"
-        local v4_out="$STAGING_V4/$code_lower.ripe.list.v4"
-        local v6_out="$STAGING_V6/$code_lower.ripe.list.v6"
+        local v4_out="${STAGING_V4}/${code_lower}.ripe.list.v4"
+        local v6_out="${STAGING_V6}/${code_lower}.ripe.list.v6"
         
         # Retrieve temp files from our array
-        local temp_v4="${temp_v4_files[$code]}"
-        local temp_v6="${temp_v6_files[$code]}"
+        local temp_v4="${temp_v4_files[${code}]}"
+        local temp_v6="${temp_v6_files[${code}]}"
 
-        validate_and_move_generated_file "$temp_v4" "$v4_out" "IPv4 ($code, RIPE)"
-        validate_and_move_generated_file "$temp_v6" "$v6_out" "IPv6 ($code, RIPE)"
+        validate_and_move_generated_file "${temp_v4}" "${v4_out}" "IPv4 (${code}, RIPE)"
+        validate_and_move_generated_file "${temp_v6}" "${v6_out}" "IPv6 (${code}, RIPE)"
     done
 }
 ###################
@@ -879,36 +893,38 @@ download_provider_ripe() {
 
 # Downloads and parses an IPv4 list for a single country from nirsoft.net.
 # @param $1 The 2-letter uppercase country code (e.g., IT)
+# Download status selects the logged skip path.
+# shellcheck disable=SC2310
 _download_country_nirsoft() {
     local code="$1"
     local code_lower="${code,,}"
-    local V4_OUT_FILE="$STAGING_V4/$code_lower.nirsoft.list.v4"
-    local V6_OUT_FILE="$STAGING_V6/$code_lower.nirsoft.list.v6"
-    local TEMP_V4_OUT_FILE="$V4_OUT_FILE.tmp"
-    local list_name="IPv4 ($code, Nirsoft)"
-    local URL="https://www.nirsoft.net/countryip/$code_lower.csv"
+    local V4_OUT_FILE="${STAGING_V4}/${code_lower}.nirsoft.list.v4"
+    local V6_OUT_FILE="${STAGING_V6}/${code_lower}.nirsoft.list.v6"
+    local TEMP_V4_OUT_FILE="${V4_OUT_FILE}.tmp"
+    local list_name="IPv4 (${code}, Nirsoft)"
+    local URL="https://www.nirsoft.net/countryip/${code_lower}.csv"
     local temp_csv_file
 
-    temp_csv_file=$(mktemp --tmpdir="$TEMP_DIR") || die "Failed to create temp file"
+    temp_csv_file=$(mktemp --tmpdir="${TEMP_DIR}") || die "Failed to create temp file"
 
-    log "INFO" "Downloading $list_name CSV from $URL"
+    log "INFO" "Downloading ${list_name} CSV from ${URL}"
 
-    if ! download_file "$URL" "$temp_csv_file"; then
-        log "WARN" "Failed to download Nirsoft CSV for $code. Skipping."
-        rm -f "$temp_csv_file"
+    if ! download_file "${URL}" "${temp_csv_file}"; then
+        log "WARN" "Failed to download Nirsoft CSV for ${code}. Skipping."
+        rm -f "${temp_csv_file}"
         return # Exit this sub-function
     fi
 
     # Parse the CSV. Format: Start IP, End IP, ..., ...
     # We convert "Start IP, End IP" to "StartIP - EndIP" for iprange
-    awk -F',' 'NF>4 {printf "%s - %s\n", $1, $2}' "$temp_csv_file" > "$TEMP_V4_OUT_FILE"
-    rm -f "$temp_csv_file" # Clean up downloaded CSV
+    awk -F',' 'NF>4 {printf "%s - %s\n", $1, $2}' "${temp_csv_file}" > "${TEMP_V4_OUT_FILE}"
+    rm -f "${temp_csv_file}" # Clean up downloaded CSV
 
-    validate_and_move_generated_file "$TEMP_V4_OUT_FILE" "$V4_OUT_FILE" "$list_name"
+    validate_and_move_generated_file "${TEMP_V4_OUT_FILE}" "${V4_OUT_FILE}" "${list_name}"
 
     # Nirsoft provides no IPv6 data.
-    # We create an empty v6 file so 'ip-blocker.sh' can find it.
-    touch "$V6_OUT_FILE"
+    # We create an empty v6 file so 'ip_blocker.sh' can find it.
+    touch "${V6_OUT_FILE}"
 }
 export -f _download_country_nirsoft
 
@@ -917,14 +933,14 @@ export -f _download_country_nirsoft
 download_provider_nirsoft() {
     local -a countries=("$@")
 
-    if [[ "$REQUIRE_IPV6_LISTS" == "true" ]]; then
+    if [[ "${REQUIRE_IPV6_LISTS}" == "true" ]]; then
         die "Provider 'nirsoft' does not publish IPv6 country lists and cannot satisfy GEOIP_REQUIRE_IPV6=true."
     fi
 
     log "INFO" "Using provider: Nirsoft (Parallel Mode, IPv4 only) for ${countries[*]}"
     for code in "${countries[@]}"; do
         wait_for_job_slot
-        _download_country_nirsoft "$code" &
+        _download_country_nirsoft "${code}" &
     done
     wait
     log "INFO" "Nirsoft parallel download complete for ${countries[*]}"
@@ -952,13 +968,13 @@ main() {
     fi
 
     # 3. Create the output directories
-    mkdir -p "$ALLOW_DIR_V4" "$ALLOW_DIR_V6" || die "Failed to create directories"
+    mkdir -p "${ALLOW_DIR_V4}" "${ALLOW_DIR_V6}" || die "Failed to create directories"
 
     # 4. Create shared temp directory and staging sub-directories
-    TEMP_DIR=$(mktemp -d "$ALLOW_ROOT_DIR/.geoip.XXXXXX") || die "Failed to create temp directory"
-    readonly STAGING_V4="$TEMP_DIR/staging_v4"
-    readonly STAGING_V6="$TEMP_DIR/staging_v6"
-    mkdir -p "$STAGING_V4" "$STAGING_V6"
+    TEMP_DIR=$(mktemp -d "${ALLOW_ROOT_DIR}/.geoip.XXXXXX") || die "Failed to create temp directory"
+    readonly STAGING_V4="${TEMP_DIR}/staging_v4"
+    readonly STAGING_V6="${TEMP_DIR}/staging_v6"
+    mkdir -p "${STAGING_V4}" "${STAGING_V6}"
 
     # Export staging paths for sub-functions
     export STAGING_V4 STAGING_V6
@@ -967,7 +983,7 @@ main() {
     log "INFO" "Preparing staging area for fresh downloads..."
 
     # 6. Parse the new syntax
-    log "INFO" "Parsing provider/country syntax: $ALLOWED_COUNTRIES_SYNTAX"
+    log "INFO" "Parsing provider/country syntax: ${ALLOWED_COUNTRIES_SYNTAX}"
 
     # Use an associative array to map providers to their country lists
     declare -A provider_country_map
@@ -976,10 +992,10 @@ main() {
 
     # Split on semicolons using parameter expansion (no subshell)
     local -a provider_groups
-    IFS=';' read -ra provider_groups <<< "$ALLOWED_COUNTRIES_SYNTAX"
+    IFS=';' read -ra provider_groups <<< "${ALLOWED_COUNTRIES_SYNTAX}"
 
     for group in "${provider_groups[@]}"; do
-        [[ -n "$group" ]] || continue # Skip empty entries
+        [[ -n "${group}" ]] || continue # Skip empty entries
 
         # Split "provider:C1,C2" using parameter expansion
         local provider_name="${group%%:*}"
@@ -990,10 +1006,10 @@ main() {
         # Validate provider against array
         local valid=false
         for p in "${ALLOWED_PROVIDERS[@]}"; do
-            [[ "$p" == "$provider_name" ]] && { valid=true; break; }
+            [[ "${p}" == "${provider_name}" ]] && { valid=true; break; }
         done
-        if ! "$valid"; then
-            die "Invalid provider '$provider_name' in syntax. Allowed: ${ALLOWED_PROVIDERS[*]}"
+        if ! "${valid}"; then
+            die "Invalid provider '${provider_name}' in syntax. Allowed: ${ALLOWED_PROVIDERS[*]}"
         fi
 
         # Sanitize country list: uppercase, remove spaces, convert comma to space
@@ -1002,7 +1018,7 @@ main() {
         sanitized_countries="${sanitized_countries//,/ }" # comma → space
 
         # Append to the map (handles a provider being listed multiple times)
-        provider_country_map[$provider_name]+="$sanitized_countries "
+        provider_country_map[${provider_name}]+="${sanitized_countries} "
 
     done
 
@@ -1017,25 +1033,25 @@ main() {
         local -A seen_countries=()
         # Deduplicate in Bash to avoid spawning sort for a tiny fixed alphabet.
         local -a raw_countries=()
-        read -ra raw_countries <<< "${provider_country_map[$provider]}"
+        read -ra raw_countries <<< "${provider_country_map[${provider}]}"
         for code in "${raw_countries[@]}"; do
-            [[ -n "${seen_countries[$code]:-}" ]] && continue
-            seen_countries[$code]=1
-            country_array+=("$code")
+            [[ -n "${seen_countries[${code}]:-}" ]] && continue
+            seen_countries[${code}]=1
+            country_array+=("${code}")
         done
 
         [[ ${#country_array[@]} -gt 0 ]] || continue # Skip if no countries
 
-        log "INFO" "Dispatching download for provider: $provider (Countries: ${country_array[*]})"
+        log "INFO" "Dispatching download for provider: ${provider} (Countries: ${country_array[*]})"
 
         local code_lower
         for code in "${country_array[@]}"; do
             code_lower="${code,,}"
-            expected_v4_files+=("$code_lower.$provider.list.v4")
-            expected_v6_files+=("$code_lower.$provider.list.v6")
+            expected_v4_files+=("${code_lower}.${provider}.list.v4")
+            expected_v6_files+=("${code_lower}.${provider}.list.v6")
         done
 
-        case "$provider" in
+        case "${provider}" in
         "ipdeny")
             # Pass the country array to the function
             download_provider_ipdeny "${country_array[@]}"
@@ -1051,7 +1067,7 @@ main() {
             ;;
         *)
             # This should be unreachable due to validation above
-            die "Unknown or unsupported provider: '$provider'"
+            die "Unknown or unsupported provider: '${provider}'"
             ;;
         esac
     done
@@ -1067,21 +1083,21 @@ main() {
     fi
 
     shopt -s nullglob
-    local -a staged_v4=("$STAGING_V4"/*.list.v4)
-    local -a staged_v6=("$STAGING_V6"/*.list.v6)
+    local -a staged_v4=("${STAGING_V4}"/*.list.v4)
+    local -a staged_v6=("${STAGING_V6}"/*.list.v6)
     shopt -u nullglob
 
     local file_count
     file_count=$((${#staged_v4[@]} + ${#staged_v6[@]}))
 
-    if [[ $file_count -eq 0 ]]; then
+    if [[ ${file_count} -eq 0 ]]; then
         die "DOWNLOAD FAILED. No Geo-IP lists were generated (provider unreachable?). Aborting to preserve existing firewall rules (CACHE SAFE)."
     fi
 
-    log "INFO" "Download successful ($file_count lists). Performing atomic directory swap..."
+    log "INFO" "Download successful (${file_count} lists). Performing atomic directory swap..."
 
-    atomic_swap_directory "$STAGING_V4" "$ALLOW_DIR_V4" "$TEMP_DIR/allow_v4.backup"
-    atomic_swap_directory "$STAGING_V6" "$ALLOW_DIR_V6" "$TEMP_DIR/allow_v6.backup"
+    atomic_swap_directory "${STAGING_V4}" "${ALLOW_DIR_V4}" "${TEMP_DIR}/allow_v4.backup"
+    atomic_swap_directory "${STAGING_V6}" "${ALLOW_DIR_V6}" "${TEMP_DIR}/allow_v6.backup"
 
     log "INFO" "All country lists updated successfully."
 }
