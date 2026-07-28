@@ -1,0 +1,35 @@
+[Unit]
+Description=NPM/NPMplus certificate monitor for Technitium
+After=network.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=labo
+Group=labo
+UMask=0077
+
+# Keep deployment-specific paths outside the public repository.
+EnvironmentFile=/home/labo/raspberry-scripts/cert_monitor.env
+Environment=CERT_MONITOR_LOCK_FILE=/run/cert_monitor/cert_monitor.lock
+RuntimeDirectory=cert_monitor
+RuntimeDirectoryMode=0700
+
+ExecStart=/home/labo/raspberry-scripts/cert_monitor.sh
+Restart=on-failure
+RestartSec=10s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Optional password-file support using systemd credentials:
+# LoadCredential=pfx_password:/home/labo/raspberry-scripts/credentials/cert_monitor.pfx_password
+# Environment=CERT_MONITOR_PASSWORD_FILE=%d/pfx_password
+
+[Install]
+WantedBy=multi-user.target

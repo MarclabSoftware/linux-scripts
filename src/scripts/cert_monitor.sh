@@ -1,354 +1,363 @@
 #!/usr/bin/env bash
-
-# =============================================================================
-# Certificate Monitor and Converter Script
-# =============================================================================
-#
-# Monitors certificate changes from either Nginx Proxy Manager (PEM files)
-# or Traefik (acme.json) and automatically converts the specified
-# certificate to PFX format for Technitium DNS Server.
-#
-# Features:
-# - Dual-mode operation (NPM or TRAEFIK) via a single setting.
-# - Directory/file monitoring with inotify.
-# - PEM-to-PFX conversion (for NPM).
-# - acme.json (Base64)-to-PFX conversion (for Traefik).
-# - Systemd service support.
-# - Robust error handling and logging.
-# - Process substitution for Traefik mode (avoids temp files).
-# - Atomic file writes to prevent data corruption.
-# - Automatic retry logic for Traefik extraction.
-#
-# Requirements:
-# - Common: openssl, inotifywait, flock
-# - Traefik Mode: jq, base64, sudo (NOPASSWD for jq, test, inotifywait)
-# - Non-root user
-#
-# Author: LaboDJ
-# Version: 2.1
-# Last Updated: 2025/11/20
-# =============================================================================
-
-# Exit on error, undefined variables, and pipe failures
 set -euo pipefail
+umask 077
 
-# --- Configuration ---
+# Monitor a certificate managed by Nginx Proxy Manager (NPM) or NPMplus and
+# publish it as a PKCS#12/PFX file. Both products expose a certificate directory
+# containing fullchain.pem and privkey.pem; the script intentionally depends on
+# that stable file contract instead of product-specific installation paths.
 #
-# Select the mode this script should run in.
-# Valid options: "NPM" or "TRAEFIK"
+# Configuration precedence is:
+#   built-in operational defaults < environment variables < CLI arguments
 #
-declare -r MONITOR_MODE="TRAEFIK"
+# Deployment-specific paths have no built-in defaults. This keeps the script
+# suitable for a public repository and prevents accidental use of another
+# machine's configuration.
 
-# --- General Settings ---
-declare -r DOCKER_DIR="${HOME}/docker"
-declare -r TECHNITIUM_DNS_DIR="${DOCKER_DIR}/technitium-dns/mnt/data"
-declare -r NEW_CERT_NAME="certificate"
-declare -r TARGET_PFX="${TECHNITIUM_DNS_DIR}/${NEW_CERT_NAME}.pfx"
+source_dir=${CERT_MONITOR_SOURCE_DIR:-}
+output_file=${CERT_MONITOR_OUTPUT:-}
+settle_seconds=${CERT_MONITOR_SETTLE_SECONDS:-10}
+lock_file=${CERT_MONITOR_LOCK_FILE:-"${XDG_RUNTIME_DIR:-/tmp}/cert_monitor_${UID}.lock"}
+output_mode=${CERT_MONITOR_OUTPUT_MODE:-0600}
+password_file=${CERT_MONITOR_PASSWORD_FILE:-}
+run_once=false
 
-# --- NPM Mode Settings ---
-# (Only used if MONITOR_MODE="NPM")
-declare -r NPM_CERT_NAME="npm-1"
-declare -r NPM_LETSENCRYPT_DIR="${DOCKER_DIR}/nginx_proxy_manager/mnt/letsencrypt"
-declare -r NPM_CERT_PATH="${NPM_LETSENCRYPT_DIR}/live/${NPM_CERT_NAME}"
+# Derived paths are populated only after configuration has been validated.
+fullchain_file=
+private_key_file=
+output_dir=
+output_name=
 
-# --- Traefik Mode Settings ---
-# (Only used if MONITOR_MODE="TRAEFIK")
-declare -r TRAEFIK_ACME_JSON_PATH="/home/labo/docker/pangolin/config/letsencrypt/acme.json"
-declare -r TRAEFIK_DOMAIN_TO_EXTRACT="djlabo.com"
-declare -r TRAEFIK_RESOLVER_NAME="letsencrypt"
+# The currently unpublished temporary PFX is tracked globally so signal and
+# error exits can remove it without touching the last known-good output.
+active_temp=
 
-# --- Lock Mechanism ---
-declare -r LOCK_FILE="/tmp/cert_monitor.lock"
-
-# --- Logging & Utility Functions ---
-
-# Check if running under systemd
-is_systemd() {
-    [[ -n "${NOTIFY_SOCKET-}" ]]
-}
-
-# Log function with levels
 log() {
-    local level="INFO"
-    if [[ "$1" == "ERROR" || "$1" == "WARN" || "$1" == "INFO" ]]; then
-        level="$1"
-        shift
-    fi
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [${level}] $*"
+    local level=${1}
+    shift
+    printf '[%(%Y-%m-%d %H:%M:%S)T] [%s] %s\n' -1 "${level}" "$*" >&2
 }
 
-# Cleanup function to be called on exit
-cleanup() {
-    log "INFO" "Releasing lock and cleaning up..."
-    # The 'flock' utility releases the lock when the file descriptor is closed.
-    rm -f "$LOCK_FILE"
-}
-
-# Error handling function
-error_exit() {
-    log "ERROR" "$*" >&2
+die() {
+    log "ERROR" "$*"
     exit 1
 }
 
-# Atomic write function for PFX
-# Arguments: $1 = Source PFX (temp), $2 = Destination PFX
-atomic_move() {
-    local src="$1"
-    local dest="$2"
-    
-    if mv -f "$src" "$dest"; then
-        chmod 644 "$dest"
-        log "INFO" "Certificate successfully updated: $dest"
-        return 0
-    else
-        log "ERROR" "Failed to move temporary file to $dest"
-        rm -f "$src"
-        return 1
-    fi
+usage() {
+    cat <<'EOF'
+Usage:
+  cert_monitor.sh --source-dir DIR --output FILE [OPTIONS]
+
+Required configuration:
+  --source-dir DIR       Directory containing fullchain.pem and privkey.pem
+  --output FILE          Absolute path of the PFX file to publish
+
+Optional configuration:
+  --settle-seconds N     Delay after a filesystem event (default: 10)
+  --lock-file FILE       Lock file used to prevent concurrent instances
+  --output-mode MODE     Published PFX permissions (default: 0600)
+  --password-file FILE   File containing the PFX password; empty by default
+  --once                 Convert once and exit without monitoring
+  -h, --help             Show this help
+
+Equivalent environment variables:
+  Required:
+    CERT_MONITOR_SOURCE_DIR
+    CERT_MONITOR_OUTPUT
+  Optional:
+    CERT_MONITOR_SETTLE_SECONDS
+    CERT_MONITOR_LOCK_FILE
+    CERT_MONITOR_OUTPUT_MODE
+    CERT_MONITOR_PASSWORD_FILE
+
+CLI arguments override environment variables. All configured paths must be
+absolute. Password contents are never accepted through CLI arguments or
+environment variables; only a password file path may be provided.
+EOF
 }
 
-# ----------------------------------------
-# Certificate Conversion Functions
-# ----------------------------------------
-
-# Converts certificate from NPM (PEM files)
-convert_certificate_npm() {
-    local fullchain="${NPM_CERT_PATH}/fullchain.pem"
-    local privkey="${NPM_CERT_PATH}/privkey.pem"
-    local temp_pfx="${TARGET_PFX}.tmp"
-
-    # Wait for file stabilization
-    log "INFO" "Waiting for 10 seconds for files to stabilize..."
-    sleep 10
-
-    # Check if source files exist and are readable
-    [[ ! -r "$fullchain" ]] && { log "ERROR" "Cannot read $fullchain"; return 1; }
-    [[ ! -r "$privkey" ]] && { log "ERROR" "Cannot read $privkey"; return 1; }
-
-    log "INFO" "Starting certificate conversion (NPM Mode)"
-
-    if openssl pkcs12 -export \
-        -in "$fullchain" \
-        -inkey "$privkey" \
-        -out "$temp_pfx" \
-        -passout pass:"" \
-        -passin pass:""; then
-        
-        atomic_move "$temp_pfx" "$TARGET_PFX"
-    else
-        log "ERROR" "Certificate conversion failed (NPM Mode)"
-        rm -f "$temp_pfx"
-        return 1
-    fi
+require_option_value() {
+    local option=${1}
+    local value=${2-}
+    [[ -n ${value} ]] || die "${option} requires a non-empty value"
 }
 
-# Converts certificate from Traefik (acme.json)
-convert_certificate_traefik() {
-    log "INFO" "Attempting to extract certificate for $TRAEFIK_DOMAIN_TO_EXTRACT (Traefik Mode)"
-
-    # Verify access to acme.json
-    if ! sudo test -s "$TRAEFIK_ACME_JSON_PATH"; then
-        log "ERROR" "$TRAEFIK_ACME_JSON_PATH not found, is empty, or not accessible via sudo."
-        return 1
-    fi
-
-    local key_b64
-    local cert_b64
-    local temp_pfx="${TARGET_PFX}.tmp"
-
-    # Extract Key
-    key_b64=$(sudo jq -r --arg r "$TRAEFIK_RESOLVER_NAME" --arg d "$TRAEFIK_DOMAIN_TO_EXTRACT" \
-        '.[$r].Certificates | .[]? | select(.domain.main == $d) | .key' "$TRAEFIK_ACME_JSON_PATH")
-
-    # Extract Certificate
-    cert_b64=$(sudo jq -r --arg r "$TRAEFIK_RESOLVER_NAME" --arg d "$TRAEFIK_DOMAIN_TO_EXTRACT" \
-        '.[$r].Certificates | .[]? | select(.domain.main == $d) | .certificate' "$TRAEFIK_ACME_JSON_PATH")
-
-    # Validate extraction
-    if [[ -z "$key_b64" || "$key_b64" == "null" ]]; then
-        log "WARN" "Private key not found for $TRAEFIK_DOMAIN_TO_EXTRACT (Resolver: $TRAEFIK_RESOLVER_NAME)."
-        return 1
-    fi
-    if [[ -z "$cert_b64" || "$cert_b64" == "null" ]]; then
-        log "WARN" "Certificate not found for $TRAEFIK_DOMAIN_TO_EXTRACT (Resolver: $TRAEFIK_RESOLVER_NAME)."
-        return 1
-    fi
-
-    log "INFO" "Certificate and key extracted. Starting PFX conversion..."
-
-    if openssl pkcs12 -export \
-        -in <(echo "$cert_b64" | base64 -d) \
-        -inkey <(echo "$key_b64" | base64 -d) \
-        -out "$temp_pfx" \
-        -name "$TRAEFIK_DOMAIN_TO_EXTRACT" \
-        -passout pass:"" \
-        -passin pass:""; then
-
-        atomic_move "$temp_pfx" "$TARGET_PFX"
-        return 0
-    else
-        log "ERROR" "OpenSSL conversion failed (Traefik Mode)."
-        rm -f "$temp_pfx"
-        return 1
-    fi
-}
-
-# Retry wrapper for Traefik conversion
-convert_with_retry() {
-    local max_retries=6
-    local retry_delay=10
-    local attempt=1
-
-
-    log "INFO" "Starting conversion sequence... (Max $max_retries attempts)"
-    
-    # Initial stabilization wait
-    sleep 5
-
-    while [[ $attempt -le $max_retries ]]; do
-        log "INFO" "Conversion attempt $attempt/$max_retries..."
-        
-        if convert_certificate_traefik; then
-            log "INFO" "Conversion successful on attempt $attempt."
-            return 0
-        else
-            log "WARN" "Conversion failed (file likely incomplete or locked)."
-            if [[ $attempt -lt $max_retries ]]; then
-                log "INFO" "Waiting ${retry_delay}s before next attempt..."
-                sleep $retry_delay
-            fi
-        fi
-        ((attempt++))
+parse_args() {
+    while (($# > 0)); do
+        case ${1} in
+            --source-dir)
+                require_option_value "${1}" "${2-}"
+                source_dir=${2}
+                shift 2
+                ;;
+            --source-dir=*)
+                source_dir=${1#*=}
+                shift
+                ;;
+            --output)
+                require_option_value "${1}" "${2-}"
+                output_file=${2}
+                shift 2
+                ;;
+            --output=*)
+                output_file=${1#*=}
+                shift
+                ;;
+            --settle-seconds)
+                require_option_value "${1}" "${2-}"
+                settle_seconds=${2}
+                shift 2
+                ;;
+            --settle-seconds=*)
+                settle_seconds=${1#*=}
+                shift
+                ;;
+            --lock-file)
+                require_option_value "${1}" "${2-}"
+                lock_file=${2}
+                shift 2
+                ;;
+            --lock-file=*)
+                lock_file=${1#*=}
+                shift
+                ;;
+            --output-mode)
+                require_option_value "${1}" "${2-}"
+                output_mode=${2}
+                shift 2
+                ;;
+            --output-mode=*)
+                output_mode=${1#*=}
+                shift
+                ;;
+            --password-file)
+                require_option_value "${1}" "${2-}"
+                password_file=${2}
+                shift 2
+                ;;
+            --password-file=*)
+                password_file=${1#*=}
+                shift
+                ;;
+            --once)
+                run_once=true
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                (($# == 0)) || die "positional arguments are not supported"
+                break
+                ;;
+            -*)
+                die "unknown option: ${1}"
+                ;;
+            *)
+                die "unexpected positional argument: ${1}"
+                ;;
+        esac
     done
-
-    log "ERROR" "All $max_retries conversion attempts failed."
-    return 1
 }
 
-# ----------------------------------------
-# Monitoring Functions
-# ----------------------------------------
+require_absolute_path() {
+    local label=${1}
+    local path=${2}
 
-monitor_npm() {
-    log "INFO" "Watching directory: $NPM_CERT_PATH"
-    inotifywait -m -e create,modify,moved_to --format '%e %f' "$NPM_CERT_PATH" |
-        while read -r event filename; do
-            if [[ "$filename" == "fullchain.pem" ]]; then
-                log "INFO" "Detected ${event} event on fullchain.pem"
-                convert_certificate_npm || log "ERROR" "NPM conversion failed, waiting for next event."
-            fi
-        done
+    [[ -n ${path} ]] || die "${label} is required"
+    [[ ${path} == /* ]] || die "${label} must be an absolute path"
 }
 
-monitor_traefik() {
-    local watch_dir
-    local watch_file
-    
-    watch_dir=$(dirname "$TRAEFIK_ACME_JSON_PATH")
-    watch_file=$(basename "$TRAEFIK_ACME_JSON_PATH")
+check_dependencies() {
+    local -a commands=(basename chmod dirname flock mktemp mv openssl)
+    local command
 
-    log "INFO" "Watching for changes to '$watch_file' in directory: $watch_dir"
-    
-    # SUDO: monitor *directory* for events
-    sudo inotifywait -m -e modify,create,moved_to "$watch_dir" --format '%e %f' |
-        while read -r event filename; do
-            if [[ "$filename" == "$watch_file" ]]; then
-                log "INFO" "Detected ${event} event on ${watch_file}"
-                convert_with_retry
-            fi
-        done
+    if [[ ${run_once} == false ]]; then
+        commands+=(inotifywait)
+    fi
+    if [[ -n ${NOTIFY_SOCKET-} ]]; then
+        commands+=(systemd-notify)
+    fi
+
+    for command in "${commands[@]}"; do
+        command -v "${command}" >/dev/null 2>&1 \
+            || die "required command not found: ${command}"
+    done
 }
 
-# --- Pre-run Checks ---
+validate_config() {
+    local lock_dir
 
-log "INFO" "Starting pre-run checks..."
+    require_absolute_path "source directory" "${source_dir}"
+    require_absolute_path "output file" "${output_file}"
+    require_absolute_path "lock file" "${lock_file}"
+    if [[ -n ${password_file} ]]; then
+        require_absolute_path "password file" "${password_file}"
+    fi
 
-# Check for non-root user
-[[ "$(id -u)" -eq 0 ]] && error_exit "Please run as a normal user"
+    [[ ${settle_seconds} =~ ^[0-9]+$ ]] \
+        || die "settle seconds must be a non-negative integer"
+    [[ ${output_mode} =~ ^0?[0-7]{3}$ ]] \
+        || die "output mode must be a three-digit octal mode, optionally prefixed by 0"
 
-# Check for common required commands
-for cmd in openssl inotifywait flock; do
-    command -v "$cmd" >/dev/null 2>&1 || error_exit "$cmd not installed"
-done
+    # Remove one trailing slash without turning the filesystem root into an
+    # empty string.
+    if [[ ${source_dir} != / ]]; then
+        source_dir=${source_dir%/}
+    fi
 
-# Check for common directory
-[[ ! -d "$TECHNITIUM_DNS_DIR" ]] && error_exit "Target Directory $TECHNITIUM_DNS_DIR does not exist"
+    fullchain_file=${source_dir}/fullchain.pem
+    private_key_file=${source_dir}/privkey.pem
+    output_dir=$(dirname -- "${output_file}")
+    output_name=$(basename -- "${output_file}")
+    lock_dir=$(dirname -- "${lock_file}")
 
-# Check write permission to target directory
-if [[ ! -w "$TECHNITIUM_DNS_DIR" ]]; then
-    error_exit "Target Directory $TECHNITIUM_DNS_DIR is not writable"
-fi
+    [[ -d ${source_dir} ]] \
+        || die "source directory does not exist: ${source_dir}"
+    [[ -r ${fullchain_file} ]] \
+        || die "certificate is not readable: ${fullchain_file}"
+    [[ -r ${private_key_file} ]] \
+        || die "private key is not readable: ${private_key_file}"
+    [[ -d ${output_dir} ]] \
+        || die "output directory does not exist: ${output_dir}"
+    [[ -w ${output_dir} ]] \
+        || die "output directory is not writable: ${output_dir}"
+    [[ ! -d ${output_file} ]] \
+        || die "output path is a directory: ${output_file}"
+    [[ -d ${lock_dir} && -w ${lock_dir} ]] \
+        || die "lock directory does not exist or is not writable: ${lock_dir}"
 
-# Mode-specific checks
-case "$MONITOR_MODE" in
-    "NPM")
-        log "INFO" "Mode: NPM. Checking NPM-specific settings..."
-        [[ ! -d "$NPM_CERT_PATH" ]] && error_exit "NPM Certificate Directory $NPM_CERT_PATH does not exist"
-        ;;
-    "TRAEFIK")
-        log "INFO" "Mode: TRAEFIK. Checking Traefik-specific settings..."
-        for cmd in jq base64 sudo; do
-            command -v "$cmd" >/dev/null 2>&1 || error_exit "$cmd not installed (required for Traefik mode)"
+    if [[ -n ${password_file} ]]; then
+        [[ -f ${password_file} && -r ${password_file} && -s ${password_file} ]] \
+            || die "password file must be a readable, non-empty regular file"
+    fi
+}
+
+acquire_lock() {
+    # Keep the lock file in place. Removing a locked path can create a second
+    # inode and allow another process to acquire a different lock concurrently.
+    exec 9>"${lock_file}"
+    flock -n 9 || die "another certificate monitor instance is already running"
+}
+
+cleanup() {
+    if [[ -n ${active_temp} ]]; then
+        rm -f -- "${active_temp}"
+    fi
+}
+
+convert_certificate() {
+    local passout=pass:
+
+    active_temp=$(mktemp "${output_dir}/.${output_name}.XXXXXX")
+    if [[ -n ${password_file} ]]; then
+        passout=file:${password_file}
+    fi
+
+    # OpenSSL verifies that the certificate and private key form a valid pair.
+    # The destination is not replaced unless the complete PFX was generated.
+    if ! openssl pkcs12 -export \
+        -in "${fullchain_file}" \
+        -inkey "${private_key_file}" \
+        -out "${active_temp}" \
+        -name "${output_name}" \
+        -passin pass: \
+        -passout "${passout}"; then
+        log "ERROR" "failed to create PFX from the current certificate pair"
+        rm -f -- "${active_temp}"
+        active_temp=
+        return 1
+    fi
+
+    if ! chmod "${output_mode}" "${active_temp}"; then
+        log "ERROR" "failed to set permissions on the temporary PFX"
+        rm -f -- "${active_temp}"
+        active_temp=
+        return 1
+    fi
+
+    # mktemp creates the file beside the destination, so rename(2) publishes it
+    # atomically on the same filesystem.
+    if ! mv -f -- "${active_temp}" "${output_file}"; then
+        log "ERROR" "failed to publish PFX: ${output_file}"
+        rm -f -- "${active_temp}"
+        active_temp=
+        return 1
+    fi
+
+    active_temp=
+    log "INFO" "PFX updated successfully: ${output_file}"
+}
+
+notify_ready() {
+    if [[ -n ${NOTIFY_SOCKET-} ]]; then
+        systemd-notify --ready --status="Monitoring ${source_dir}"
+        log "INFO" "systemd notified that the monitor is ready"
+    fi
+}
+
+monitor_source() {
+    local changed_file
+
+    log "INFO" "Watching certificate directory: ${source_dir}"
+
+    # A continuous watch avoids missing events while conversion is running.
+    # Multiple renewal events may intentionally cause a second harmless
+    # conversion; correctness is preferred over a fragile debounce mechanism.
+    inotifywait \
+        --monitor \
+        --quiet \
+        --event attrib \
+        --event close_write \
+        --event create \
+        --event delete \
+        --event moved_from \
+        --event moved_to \
+        --format '%f' \
+        -- "${source_dir}" \
+        | while IFS= read -r changed_file; do
+            case ${changed_file} in
+                fullchain.pem | privkey.pem)
+                    log "INFO" "Detected certificate update: ${changed_file}"
+                    sleep "${settle_seconds}"
+
+                    # Conversion failure is non-fatal while monitoring: the
+                    # last known-good PFX remains published and a later event can
+                    # retry the conversion.
+                    # shellcheck disable=SC2310
+                    if ! convert_certificate; then
+                        log "WARN" "PFX update failed; keeping the previous output"
+                    fi
+                    ;;
+                *) ;;
+            esac
         done
-        
-        # Check sudo access (non-interactive)
-        if ! sudo -n true 2>/dev/null; then
-            log "WARN" "Sudo requires a password or is not configured. This script requires passwordless sudo for 'jq', 'test', and 'inotifywait'."
-            # We don't exit here, but warn the user.
-        fi
 
-        # SUDO: Use 'sudo test' to check for the file
-        if ! sudo test -f "$TRAEFIK_ACME_JSON_PATH"; then
-             error_exit "Traefik acme.json file $TRAEFIK_ACME_JSON_PATH not found or not accessible via sudo"
-        fi
-        ;;
-    *)
-        error_exit "Invalid MONITOR_MODE: '${MONITOR_MODE}'. Must be 'NPM' or 'TRAEFIK'."
-        ;;
-esac
+    die "certificate filesystem monitor stopped unexpectedly"
+}
 
-log "INFO" "Pre-run checks passed."
+main() {
+    parse_args "$@"
+    check_dependencies
+    validate_config
+    acquire_lock
 
-# --- Main Execution ---
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
-# Open lock file on file descriptor 200. Create it if it doesn't exist.
-exec 200>"$LOCK_FILE" || error_exit "Cannot open lock file ${LOCK_FILE}"
+    log "INFO" "Creating the initial PFX"
+    convert_certificate
+    notify_ready
 
-# Try to acquire an exclusive, non-blocking lock.
-if ! flock -n 200; then
-    error_exit "Script is already running."
-fi
+    if [[ ${run_once} == true ]]; then
+        log "INFO" "One-shot conversion completed"
+        return 0
+    fi
 
-# Trap signals for clean exit
-trap 'cleanup; exit 0' SIGINT SIGTERM
+    monitor_source
+}
 
-log "INFO" "Starting certificate monitor in ${MONITOR_MODE} mode."
-
-# Notify systemd that the service is initialized
-if is_systemd; then
-    systemd-notify --ready
-    log "INFO" "Systemd service notified: READY"
-fi
-
-# --- Initial Conversion ---
-# Run conversion once on startup to ensure PFX is up-to-date
-log "INFO" "Performing initial conversion on startup..."
-case "$MONITOR_MODE" in
-    "NPM")
-        convert_certificate_npm || log "WARN" "Initial NPM conversion skipped (files might not exist yet)."
-        ;;
-    "TRAEFIK")
-        convert_certificate_traefik || log "WARN" "Initial Traefik conversion skipped (acme.json might be empty or domain not found)."
-        ;;
-esac
-
-# --- Monitoring Loop ---
-log "INFO" "Starting monitoring loop..."
-case "$MONITOR_MODE" in
-    "NPM")
-        monitor_npm
-        ;;
-    "TRAEFIK")
-        monitor_traefik
-        ;;
-esac
+main "$@"

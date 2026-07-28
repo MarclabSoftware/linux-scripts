@@ -1,2 +1,10 @@
 build
 .vscode/settings.json
+
+# Local certificate-monitor configuration and generated key material.
+*.env
+!*.env.example
+*.key
+*.pem
+*.pfx
+credentials/
