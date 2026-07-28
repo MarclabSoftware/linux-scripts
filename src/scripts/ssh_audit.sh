@@ -7,41 +7,39 @@
 # tool with enhanced error handling and performance optimizations.
 #
 # Author: LaboDJ
-# Version: 1.2
-# Last Updated: 2025/01/27
+# Version: 1.4
+# Last Updated: 2026/07/28
 ###############################################################################
 
-# Enable strict mode for better error handling and debugging (https://vaneyckt.io/posts/safer_bash_scripts_with_set_euxo_pipefail/)
 set -Eeuo pipefail
 
 # Constants
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 readonly SCRIPT_DIR
 readonly GIT_URL="https://github.com/jtesta/ssh-audit.git"
-readonly TOOL_DIR="$SCRIPT_DIR/ssh-audit"
-# Default parameters if none provided
-readonly DEFAULT_PARAMS="localhost -4"
+readonly TOOL_DIR="${SCRIPT_DIR}/ssh-audit"
 
 trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
 
-# shellcheck disable=SC2317
+# The ERR trap invokes this function indirectly.
+# shellcheck disable=SC2317,SC2329
 error_handler() {
     local exit_code=$1
     local line_number=$2
     local last_command=$3
 
     printf "Error at line %d\nCommand: %s\nExit code: %d\n" \
-        "$line_number" "$last_command" "$exit_code" >&2
-    exit "$exit_code"
+        "${line_number}" "${last_command}" "${exit_code}" >&2
+    exit "${exit_code}"
 }
 
 # Optimized logging function using printf instead of echo
 log() {
-    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >&2
+    printf '[%(%Y-%m-%d %H:%M:%S)T] [%s] %s\n' -1 "$1" "$2" >&2
 }
 
 # Check for root privileges - fail fast principle
-[[ "${EUID:-$(id -u)}" -eq 0 ]] && {
+[[ "${EUID}" -eq 0 ]] && {
     log "ERROR" "Do not run as root"
     exit 1
 }
@@ -50,7 +48,7 @@ log() {
 check_dependencies() {
     local -a missing_deps=()
     for cmd in git python3; do
-        command -v "$cmd" >/dev/null 2>&1 || missing_deps+=("$cmd")
+        command -v "${cmd}" >/dev/null 2>&1 || missing_deps+=("${cmd}")
     done
 
     if ((${#missing_deps[@]} > 0)); then
@@ -61,14 +59,14 @@ check_dependencies() {
 
 # Update or clone repository with optimized git commands
 update_repository() {
-    if [[ -d "$TOOL_DIR" ]]; then
-        (cd "$TOOL_DIR" && git pull --depth 1 --no-tags) ||
+    if [[ -d "${TOOL_DIR}" ]]; then
+        (cd "${TOOL_DIR}" && git pull --depth 1 --no-tags) ||
             {
                 log "ERROR" "Failed to update repository"
                 exit 1
             }
     else
-        git clone --depth 1 --no-tags "$GIT_URL" "$TOOL_DIR" ||
+        git clone --depth 1 --no-tags "${GIT_URL}" "${TOOL_DIR}" ||
             {
                 log "ERROR" "Failed to clone repository"
                 exit 1
@@ -91,11 +89,24 @@ main() {
     }
 
     # Determine parameters to use
-    local audit_params
-    if [ $# -eq 0 ]; then
-        # Split default parameters into array
-        read -r -a audit_params <<<"$DEFAULT_PARAMS"
-        log "INFO" "Using default parameters: $DEFAULT_PARAMS"
+    local -a audit_params=()
+    if [[ $# -eq 0 ]]; then
+        # Prefer an explicit port, then the current SSH session's server port.
+        # SSH_CONNECTION contains: client address, client port, server address,
+        # and server port. Fall back to the standard SSH port outside a session.
+        local -a connection_fields=()
+        local audit_port
+        read -r -a connection_fields <<<"${SSH_CONNECTION-}"
+        audit_port="${SSH_AUDIT_PORT:-${connection_fields[3]:-22}}"
+
+        if [[ ! "${audit_port}" =~ ^[0-9]{1,5}$ ]] ||
+            ((10#${audit_port} < 1 || 10#${audit_port} > 65535)); then
+            log "ERROR" "Invalid SSH_AUDIT_PORT: ${audit_port}"
+            exit 1
+        fi
+
+        audit_params=(-4 -p "${audit_port}" localhost)
+        log "INFO" "Using default target: localhost:${audit_port}"
     else
         # Use all passed parameters as array
         audit_params=("$@")
