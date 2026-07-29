@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
 
-###############################################################################
-# SSH Security Audit Script
+# SSH Security Audit
+# Version: 2.0.0
+# Updated: 2026-07-29
 #
-# Performs automated security assessment of SSH configurations using ssh-audit
-# tool with enhanced error handling and performance optimizations.
-#
-# Author: LaboDJ
-# Version: 1.4
-# Last Updated: 2026/07/28
-###############################################################################
+# Keeps a shallow ssh-audit checkout in the user cache and audits either the
+# arguments supplied by the caller or the local SSH daemon. When run inside an
+# SSH session, the local daemon port is inferred from SSH_CONNECTION.
 
 set -Eeuo pipefail
 
-# Constants
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-readonly SCRIPT_DIR
 readonly GIT_URL="https://github.com/jtesta/ssh-audit.git"
-readonly TOOL_DIR="${SCRIPT_DIR}/ssh-audit"
+readonly TOOL_DIR="${SSH_AUDIT_TOOL_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/ssh-audit}"
 
 trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
 
@@ -33,18 +27,15 @@ error_handler() {
     exit "${exit_code}"
 }
 
-# Optimized logging function using printf instead of echo
 log() {
     printf '[%(%Y-%m-%d %H:%M:%S)T] [%s] %s\n' -1 "$1" "$2" >&2
 }
 
-# Check for root privileges - fail fast principle
 [[ "${EUID}" -eq 0 ]] && {
     log "ERROR" "Do not run as root"
     exit 1
 }
 
-# Check dependencies using parallel processing
 check_dependencies() {
     local -a missing_deps=()
     for cmd in git python3; do
@@ -57,15 +48,18 @@ check_dependencies() {
     fi
 }
 
-# Update or clone repository with optimized git commands
 update_repository() {
-    if [[ -d "${TOOL_DIR}" ]]; then
-        (cd "${TOOL_DIR}" && git pull --depth 1 --no-tags) ||
+    if [[ -d "${TOOL_DIR}/.git" ]]; then
+        (cd "${TOOL_DIR}" && git pull --ff-only --depth 1 --no-tags) ||
             {
                 log "ERROR" "Failed to update repository"
                 exit 1
             }
+    elif [[ -e "${TOOL_DIR}" ]]; then
+        log "ERROR" "Tool path exists but is not a Git checkout: ${TOOL_DIR}"
+        exit 1
     else
+        mkdir -p -- "$(dirname -- "${TOOL_DIR}")"
         git clone --depth 1 --no-tags "${GIT_URL}" "${TOOL_DIR}" ||
             {
                 log "ERROR" "Failed to clone repository"
@@ -74,21 +68,23 @@ update_repository() {
     fi
 }
 
-# Main execution block with proper error handling
 main() {
     log "INFO" "Starting SSH security audit"
+
+    [[ "${TOOL_DIR}" == /* ]] || {
+        log "ERROR" "SSH_AUDIT_TOOL_DIR must be an absolute path"
+        exit 1
+    }
 
     check_dependencies
 
     update_repository
 
-    # Verify ssh-audit.py existence
     [[ -f "${TOOL_DIR}/ssh-audit.py" ]] || {
         log "ERROR" "ssh-audit.py not found"
         exit 1
     }
 
-    # Determine parameters to use
     local -a audit_params=()
     if [[ $# -eq 0 ]]; then
         # Prefer an explicit port, then the current SSH session's server port.
@@ -108,19 +104,14 @@ main() {
         audit_params=(-4 -p "${audit_port}" localhost)
         log "INFO" "Using default target: localhost:${audit_port}"
     else
-        # Use all passed parameters as array
         audit_params=("$@")
         log "INFO" "Using custom parameters: ${audit_params[*]}"
     fi
 
-    # Execute ssh-audit with timeout and parameters
     log "INFO" "Running ssh-audit..."
     "${TOOL_DIR}/ssh-audit.py" "${audit_params[@]}" || true
 
     log "INFO" "Audit completed successfully"
 }
 
-# Execute main function with all script parameters
 main "$@"
-
-exit 0
