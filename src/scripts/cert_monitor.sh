@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-set -euo pipefail
-umask 077
 
-# Monitor a certificate managed by Nginx Proxy Manager (NPM) or NPMplus and
-# publish it as a PKCS#12/PFX file. Both products expose a certificate directory
-# containing fullchain.pem and privkey.pem; the script intentionally depends on
-# that stable file contract instead of product-specific installation paths.
+# NPM/NPMplus Certificate Monitor
+# Version: 2.0.0
+# Updated: 2026-07-29
+#
+# Monitors a certificate managed by Nginx Proxy Manager (NPM) or NPMplus and
+# publishes it as a PKCS#12/PFX file. Both products expose a certificate
+# directory containing fullchain.pem and privkey.pem; the script intentionally
+# depends on that stable file contract instead of installation-specific paths.
 #
 # Configuration precedence is:
 #   built-in operational defaults < environment variables < CLI arguments
 #
-# Deployment-specific paths have no built-in defaults. This keeps the script
-# suitable for a public repository and prevents accidental use of another
-# machine's configuration.
+# The companion systemd unit loads cert_monitor.env beside the script.
+# Deployment-specific paths have no built-in defaults.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
 source_dir=${CERT_MONITOR_SOURCE_DIR:-}
 output_file=${CERT_MONITOR_OUTPUT:-}
@@ -182,8 +187,8 @@ check_dependencies() {
     fi
 
     for command in "${commands[@]}"; do
-        command -v "${command}" >/dev/null 2>&1 \
-            || die "required command not found: ${command}"
+        command -v "${command}" >/dev/null 2>&1 ||
+            die "required command not found: ${command}"
     done
 }
 
@@ -197,10 +202,10 @@ validate_config() {
         require_absolute_path "password file" "${password_file}"
     fi
 
-    [[ ${settle_seconds} =~ ^[0-9]+$ ]] \
-        || die "settle seconds must be a non-negative integer"
-    [[ ${output_mode} =~ ^0?[0-7]{3}$ ]] \
-        || die "output mode must be a three-digit octal mode, optionally prefixed by 0"
+    [[ ${settle_seconds} =~ ^[0-9]+$ ]] ||
+        die "settle seconds must be a non-negative integer"
+    [[ ${output_mode} =~ ^0?[0-7]{3}$ ]] ||
+        die "output mode must be a three-digit octal mode, optionally prefixed by 0"
 
     # Remove one trailing slash without turning the filesystem root into an
     # empty string.
@@ -214,24 +219,24 @@ validate_config() {
     output_name=$(basename -- "${output_file}")
     lock_dir=$(dirname -- "${lock_file}")
 
-    [[ -d ${source_dir} ]] \
-        || die "source directory does not exist: ${source_dir}"
-    [[ -r ${fullchain_file} ]] \
-        || die "certificate is not readable: ${fullchain_file}"
-    [[ -r ${private_key_file} ]] \
-        || die "private key is not readable: ${private_key_file}"
-    [[ -d ${output_dir} ]] \
-        || die "output directory does not exist: ${output_dir}"
-    [[ -w ${output_dir} ]] \
-        || die "output directory is not writable: ${output_dir}"
-    [[ ! -d ${output_file} ]] \
-        || die "output path is a directory: ${output_file}"
-    [[ -d ${lock_dir} && -w ${lock_dir} ]] \
-        || die "lock directory does not exist or is not writable: ${lock_dir}"
+    [[ -d ${source_dir} ]] ||
+        die "source directory does not exist: ${source_dir}"
+    [[ -r ${fullchain_file} ]] ||
+        die "certificate is not readable: ${fullchain_file}"
+    [[ -r ${private_key_file} ]] ||
+        die "private key is not readable: ${private_key_file}"
+    [[ -d ${output_dir} ]] ||
+        die "output directory does not exist: ${output_dir}"
+    [[ -w ${output_dir} ]] ||
+        die "output directory is not writable: ${output_dir}"
+    [[ ! -d ${output_file} ]] ||
+        die "output path is a directory: ${output_file}"
+    [[ -d ${lock_dir} && -w ${lock_dir} ]] ||
+        die "lock directory does not exist or is not writable: ${lock_dir}"
 
     if [[ -n ${password_file} ]]; then
-        [[ -f ${password_file} && -r ${password_file} && -s ${password_file} ]] \
-            || die "password file must be a readable, non-empty regular file"
+        [[ -f ${password_file} && -r ${password_file} && -s ${password_file} ]] ||
+            die "password file must be a readable, non-empty regular file"
     fi
 }
 
@@ -316,8 +321,8 @@ monitor_source() {
         --event moved_from \
         --event moved_to \
         --format '%f' \
-        -- "${source_dir}" \
-        | while IFS= read -r changed_file; do
+        -- "${source_dir}" |
+        while IFS= read -r changed_file; do
             case ${changed_file} in
                 fullchain.pem | privkey.pem)
                     log "INFO" "Detected certificate update: ${changed_file}"

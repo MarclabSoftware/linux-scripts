@@ -1,0 +1,49 @@
+[Unit]
+Description=NPM/NPMplus certificate monitor for Technitium
+# Instance: Linux account that owns /home/<instance>/scripts.
+# Example: cert_monitor@service-user.service
+After=network.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=%i
+Group=%i
+UMask=0077
+
+# The instance name is the account that owns the script and configuration.
+EnvironmentFile=/home/%i/scripts/cert_monitor.env
+Environment=CERT_MONITOR_LOCK_FILE=/run/cert_monitor-%i/cert_monitor.lock
+RuntimeDirectory=cert_monitor-%i
+RuntimeDirectoryMode=0700
+
+ExecStart=/home/%i/scripts/cert_monitor.sh
+Restart=on-failure
+RestartSec=10s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Optional password-file support using systemd credentials:
+# LoadCredential=pfx_password:/home/%i/scripts/credentials/cert_monitor.pfx_password
+# Environment=CERT_MONITOR_PASSWORD_FILE=%d/pfx_password
+
+[Install]
+WantedBy=multi-user.target
