@@ -2,7 +2,9 @@
 # shellcheck disable=SC2250
 
 ###############################################################################
-# Guided System Clone Script (RPi & x86) v2.4
+# Guided System Clone Script (Raspberry Pi and x86)
+# Version: 2.5.0
+# Updated: 2026-07-29
 #
 # Creates a bootable file-level clone of the running Linux system to an external
 # drive for supported layouts.
@@ -18,7 +20,6 @@
 #
 # Requirements: rsync, parted, mkfs.*, blkid, lsblk, findmnt
 # Supported: ext4 root + single vfat boot mount + RPi firmware or systemd-boot
-# Author: LaboDJ | Last Updated: 2026/04/14
 ###############################################################################
 
 # Enable strict mode:
