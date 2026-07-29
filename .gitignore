@@ -1,10 +1,19 @@
 build
-.vscode/settings.json
+/.vscode/settings.json
 
-# Local certificate-monitor configuration and generated key material.
+# Machine-specific configuration.
 *.env
 !*.env.example
+*.paths
+!*.paths.example
+/src/scripts/power_state.conf
+
+# Secrets and generated certificate material.
 *.key
 *.pem
 *.pfx
 credentials/
+
+# Private host inventories and runtime output.
+/private/
+*.log
