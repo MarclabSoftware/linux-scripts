@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-###############################################################################
 # IP-Based Firewall Configuration Script
+# Version: 6.0.0
+# Updated: 2026-07-29
 #
 # Configures a robust, hybrid-backend firewall (nftables/iptables) with a
 # focus on Geo-IP filtering, SSH brute-force mitigation, and Docker protection.
-# Supports systemd-networkd renamed interfaces (e.g. lan_server) alongside
-# standard eth*/en* names — interfaces that don't exist are safely ignored.
+# Supports renamed interfaces and standard wildcard patterns; interfaces that
+# do not exist are safely ignored.
 #
 # Core Features:
 # - Auto-Backend: Prefers 'nftables', falls back to 'iptables'/'ipset'.
@@ -41,11 +42,6 @@
 # Environment:
 #   DNS_SERVERS    Custom DNS servers for early-boot resolution (e.g. "8.8.8.8 1.1.1.1")
 #
-# Author: LaboDJ
-# Version: 5.10
-# Last Updated: 2026/07/28
-###############################################################################
-
 # Enable strict mode:
 # -E: Inherit traps (ERR, DEBUG, RETURN) in functions.
 # -e: Exit immediately if a command exits with a non-zero status.
@@ -58,15 +54,41 @@ set -Eeuo pipefail
 # Global Constants
 ###################
 
-# Default country code if none is specified via -c
-declare -r DEFAULT_COUNTRIES="IT"
 # Get the script's absolute directory
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 declare -r SCRIPT_DIR
+
+# Load host-specific policy before defining immutable runtime settings.
+load_environment() {
+    local env_file="${IP_BLOCKER_ENV_FILE:-${SCRIPT_DIR}/ip_blocker.env}"
+    local env_mode
+
+    [[ -e "${env_file}" ]] || return 0
+    [[ -f "${env_file}" && -r "${env_file}" ]] || {
+        printf 'ip_blocker: environment file is not readable: %s\n' "${env_file}" >&2
+        exit 1
+    }
+    env_mode="$(stat -c '%a' "${env_file}")"
+    (((8#${env_mode} & 8#022) == 0)) || {
+        printf 'ip_blocker: environment file must not be group/world writable: %s\n' "${env_file}" >&2
+        exit 1
+    }
+
+    set -a
+    # The environment file is trusted administrator-controlled shell syntax.
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
+}
+
+load_environment
+
+# Default policy. CLI arguments override these values.
+declare -r DEFAULT_COUNTRIES="${IP_BLOCKER_COUNTRIES:-}"
 # Path to the downloader script
 declare -r COUNTRY_IPS_DOWNLOADER="${SCRIPT_DIR}/geo_ip_downloader.sh"
 # Directory structure
-declare -r IP_LIST_DIR="${SCRIPT_DIR}/lists"
+declare -r IP_LIST_DIR="${IP_BLOCKER_LIST_DIR:-${SCRIPT_DIR}/lists}"
 declare -r GENERATED_ALLOW_ROOT_DIR="${IP_LIST_DIR}/allow/generated"
 declare -r ALLOW_LIST_DIR_V4="${GENERATED_ALLOW_ROOT_DIR}/v4"
 declare -r ALLOW_LIST_DIR_V6="${GENERATED_ALLOW_ROOT_DIR}/v6"
@@ -100,25 +122,27 @@ declare -r BLOCK_LIST_URL="https://raw.githubusercontent.com/Adamm00/IPSet_ASUS/
 declare -r BLOCK_LIST_FILE_NAME="${BLOCK_SOURCE_ROOT_DIR}/index.txt"
 declare -r MANUAL_BLOCK_SOURCES_FILE="${MANUAL_BLOCK_ROOT_DIR}/sources.txt"
 declare -r LEGACY_MANUAL_BLOCK_SOURCES_FILE="${IP_LIST_DIR}/manual_blocklist.txt"
-# Our main table name for nftables
-declare -r NFT_TABLE_NAME="labo_firewall"
+# Firewall object names are configurable to support parallel/migrated policies.
+declare -r NFT_TABLE_NAME="${IP_BLOCKER_NFT_TABLE_NAME:-ip_blocker}"
+declare -r IPTABLES_CHAIN_PREFIX="${IP_BLOCKER_IPTABLES_CHAIN_PREFIX:-IPBLOCKER}"
 # Names for our sets/ipsets
 declare -r ALLOW_LIST_NAME_V4="allowlist_v4"
 declare -r ALLOW_LIST_NAME_V6="allowlist_v6"
 # Geo-IP Provider settings
 # Default provider if -p is not used
-declare -r DEFAULT_PROVIDER="ipdeny"
+declare -r DEFAULT_PROVIDER="${IP_BLOCKER_PROVIDER:-ipdeny}"
 declare -ra ALLOWED_PROVIDERS=(ipdeny ripe nirsoft)
 # Max retries for downloader
-declare -r MAX_RETRIES=3
+declare -r MAX_RETRIES="${IP_BLOCKER_MAX_RETRIES:-3}"
 # Sites to test connectivity (DNS resolution + TCP, via curl HEAD)
-declare -r CONNECTIVITY_CHECK_SITES=(github.com google.com)
+read -r -a CONNECTIVITY_CHECK_SITES <<<"${IP_BLOCKER_CONNECTIVITY_CHECK_SITES:-github.com google.com}"
+declare -r CONNECTIVITY_CHECK_SITES
 # How long to wait for DNS/network to come up (seconds). Relevant at boot.
-declare -r CONNECTIVITY_MAX_WAIT=120
+declare -r CONNECTIVITY_MAX_WAIT="${IP_BLOCKER_CONNECTIVITY_MAX_WAIT:-120}"
 # Interval between connectivity retries (seconds)
-declare -r CONNECTIVITY_RETRY_INTERVAL=10
+declare -r CONNECTIVITY_RETRY_INTERVAL="${IP_BLOCKER_CONNECTIVITY_RETRY_INTERVAL:-10}"
 # Lock directory for singleton execution
-declare -r LOCK_DIR="/var/run/ip_blocker.lock"
+declare -r LOCK_DIR="${IP_BLOCKER_LOCK_DIR:-/run/ip_blocker.lock}"
 # RFC 1918 private IPv4 ranges plus the unspecified address used by DHCP/BOOTP
 # clients before configuration — used in both nftables sets and iptables rules.
 declare -ra PRIVATE_NETS_V4=("0.0.0.0/32" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
@@ -128,8 +152,8 @@ declare -ra PRIVATE_NETS_V6=("fe80::/10" "fc00::/7" "ff00::/8")
 # Wildcards are expanded by the firewall backend:
 #   nftables: oifname "eth*"    (native glob, safe if iface doesn't exist)
 #   iptables: -o eth+           ('+' = kernel wildcard, safe if iface doesn't exist)
-# "lan_server" is a systemd-networkd renamed interface; if absent, rules simply never match.
-declare -ra NAT_INTERFACES=("eth*" "en*" "lan_server")
+read -r -a NAT_INTERFACES <<<"${IP_BLOCKER_NAT_INTERFACES:-eth* en*}"
+declare -r NAT_INTERFACES
 
 ###################
 # Global Variables
@@ -137,11 +161,12 @@ declare -ra NAT_INTERFACES=("eth*" "en*" "lan_server")
 
 # These variables are set by parse_arguments()
 declare ALLOWED_COUNTRIES="${DEFAULT_COUNTRIES}"
-declare USE_BLOCKLIST=false
-declare SSH_PORT=22
-declare GEOBLOCK_IPV6=false # Default: IPv6 is NOT geo-blocked
+declare USE_BLOCKLIST="${IP_BLOCKER_USE_BLOCKLIST:-false}"
+declare SSH_PORT="${IP_BLOCKER_SSH_PORT:-22}"
+declare GEOBLOCK_IPV6="${IP_BLOCKER_GEOBLOCK_IPV6:-false}"
 declare GEO_IP_PROVIDER="${DEFAULT_PROVIDER}"
-declare FLOWTABLE_INTERFACES=""
+declare FLOWTABLE_INTERFACES="${IP_BLOCKER_FLOWTABLE_INTERFACES:-}"
+declare CHECK_CONFIG=false
 
 # Secure temp directory
 declare TEMP_DIR=""
@@ -179,7 +204,7 @@ handle_error() {
     local line_number=$1
     local i stack_trace=""
     for ((i = 1; i < ${#FUNCNAME[@]}; i++)); do
-        stack_trace+="${FUNCNAME[${i}]}(L${BASH_LINENO[$((i-1))]})"
+        stack_trace+="${FUNCNAME[${i}]}(L${BASH_LINENO[$((i - 1))]})"
         ((i < ${#FUNCNAME[@]} - 1)) && stack_trace+=" → "
     done
     log "ERROR" "Script failed at line ${line_number} with exit code ${exit_code} | stack: ${stack_trace}"
@@ -212,7 +237,7 @@ _resolve_hostname() {
     local ip
     local rrtype
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        read -ra servers <<< "${DNS_SERVERS:-}"
+        read -ra servers <<<"${DNS_SERVERS:-}"
     fi
 
     # Try each DNS server until one succeeds
@@ -281,11 +306,14 @@ build_resolve_options_for_url() {
     local resolve_ip
     local resolved_ips
 
-    [[ -n "${DNS_SERVERS:-}" ]] || { printf -v "${result_var}" '%s' ""; return 0; }
+    [[ -n "${DNS_SERVERS:-}" ]] || {
+        printf -v "${result_var}" '%s' ""
+        return 0
+    }
 
     parse_url_endpoint "${url}"
     resolved_ips=$(_resolve_hostname "${URL_PARSE_HOST}")
-    read -ra ips <<< "${resolved_ips}"
+    read -ra ips <<<"${resolved_ips}"
     for ip in "${ips[@]}"; do
         resolve_ip="${ip}"
         [[ "${resolve_ip}" == *:* ]] && resolve_ip="[${resolve_ip}]"
@@ -308,7 +336,7 @@ file_has_markup_header() {
         if [[ "${line}" == *'<!doctype'* || "${line}" == *'<?xml'* || "${line}" == *'<!--'* || "${line}" == *'<html'* || "${line}" == *'<head'* || "${line}" == *'<body'* ]]; then
             return 0
         fi
-    done < "${file}"
+    done <"${file}"
 
     return 1
 }
@@ -398,7 +426,7 @@ setup_temp_dir_and_traps() {
         fi
     fi
     # Write our PID to the lock
-    echo "$$" > "${LOCK_DIR}/pid"
+    echo "$$" >"${LOCK_DIR}/pid"
 
     # 3. Create secure temp directory under the persistent list root.
     # Keeping staging on the same filesystem as the target directories preserves
@@ -424,7 +452,7 @@ print_usage() {
     local exit_code="${1:-1}"
     cat <<EOF
 
-Usage: $0 [-c countries] [-p provider] [-b] [-G] [-s sshPort] [-i interfaces] [-h]
+Usage: $0 [-c countries] [-p provider] [-b] [-G] [-s sshPort] [-i interfaces] [-C] [-h]
 
 Options:
     -c countries   Specify allowed countries
@@ -435,6 +463,7 @@ Options:
     -G             Enable Geo-blocking for IPv6 (default: false; needed for v6 blocks)
     -s sshPort     Specify SSH port (default: 22)
     -i interfaces  Interfaces for Flowtable offload (e.g. "eth0 wg0 br-*")
+    -C             Validate configuration without changing the firewall
     -h             Display this help message
 EOF
     exit "${exit_code}"
@@ -443,25 +472,59 @@ EOF
 # Parse command line arguments using getopts
 parse_arguments() {
     if [[ $# -eq 0 ]]; then
-      log "WARN" "No arguments provided. Using defaults (Countries: ${DEFAULT_COUNTRIES})."
+        log "INFO" "No CLI arguments provided; using environment configuration."
     fi
     OPTIND=1
     # Silent mode (optstring starts with ':'): unknown opts land in '?' case,
     # missing args land in ':' case — OPTERR is ignored.
-    while getopts ":c:p:bs:i:hG" opt; do
+    while getopts ":c:p:bs:i:hGC" opt; do
         case ${opt} in
-        c) ALLOWED_COUNTRIES="${OPTARG}" ;;
-        p) GEO_IP_PROVIDER="${OPTARG}" ;;
-        b) USE_BLOCKLIST=true ;;
-        G) GEOBLOCK_IPV6=true ;;
-        s) SSH_PORT="${OPTARG}" ;;
-        i) FLOWTABLE_INTERFACES="${OPTARG}" ;;
-        h) print_usage 0 ;;
-        \?) log "ERROR" "Invalid option: -${OPTARG}"; print_usage ;;
-        :) log "ERROR" "The option -${OPTARG} requires an argument"; print_usage ;;
-        *) log "ERROR" "Unexpected option parser state"; print_usage ;;
+            c) ALLOWED_COUNTRIES="${OPTARG}" ;;
+            p) GEO_IP_PROVIDER="${OPTARG}" ;;
+            b) USE_BLOCKLIST=true ;;
+            G) GEOBLOCK_IPV6=true ;;
+            s) SSH_PORT="${OPTARG}" ;;
+            i) FLOWTABLE_INTERFACES="${OPTARG}" ;;
+            C) CHECK_CONFIG=true ;;
+            h) print_usage 0 ;;
+            \?)
+                log "ERROR" "Invalid option: -${OPTARG}"
+                print_usage
+                ;;
+            :)
+                log "ERROR" "The option -${OPTARG} requires an argument"
+                print_usage
+                ;;
+            *)
+                log "ERROR" "Unexpected option parser state"
+                print_usage
+                ;;
         esac
     done
+
+    case "${USE_BLOCKLIST}" in
+        1 | true) USE_BLOCKLIST=true ;;
+        0 | false) USE_BLOCKLIST=false ;;
+        *) die "IP_BLOCKER_USE_BLOCKLIST must be 0, 1, true or false" ;;
+    esac
+    case "${GEOBLOCK_IPV6}" in
+        1 | true) GEOBLOCK_IPV6=true ;;
+        0 | false) GEOBLOCK_IPV6=false ;;
+        *) die "IP_BLOCKER_GEOBLOCK_IPV6 must be 0, 1, true or false" ;;
+    esac
+
+    [[ "${IP_LIST_DIR}" == /* && "${LOCK_DIR}" == /* ]] ||
+        die "list and lock directories must be absolute paths"
+    [[ "${NFT_TABLE_NAME}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+        die "IP_BLOCKER_NFT_TABLE_NAME is not a valid nftables identifier"
+    [[ "${IPTABLES_CHAIN_PREFIX}" =~ ^[A-Z][A-Z0-9_]{0,15}$ ]] ||
+        die "IP_BLOCKER_IPTABLES_CHAIN_PREFIX must be 1-16 uppercase letters, digits or underscores"
+    for integer_setting in MAX_RETRIES CONNECTIVITY_MAX_WAIT CONNECTIVITY_RETRY_INTERVAL; do
+        [[ "${!integer_setting}" =~ ^[1-9][0-9]*$ ]] ||
+            die "${integer_setting} must be a positive integer"
+    done
+    ((${#CONNECTIVITY_CHECK_SITES[@]} > 0)) ||
+        die "IP_BLOCKER_CONNECTIVITY_CHECK_SITES must not be empty"
 
     # Validate SSH port is a valid number
     if [[ ! "${SSH_PORT}" =~ ^[0-9]+$ ]] || [[ "${SSH_PORT}" -lt 1 ]] || [[ "${SSH_PORT}" -gt 65535 ]]; then
@@ -472,26 +535,33 @@ parse_arguments() {
     ALLOWED_COUNTRIES="${ALLOWED_COUNTRIES%%;}"
     ALLOWED_COUNTRIES="${ALLOWED_COUNTRIES%%,}"
 
-    # Validate country codes based on syntax
+    # Validate country codes and every provider in advanced syntax.
     if [[ "${ALLOWED_COUNTRIES}" == *":"* ]]; then
         # Advanced syntax (e.g., "ripe:IT,FR;ipdeny:CN")
         local adv_regex='^[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*(;[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*)*$'
         if [[ ! "${ALLOWED_COUNTRIES}" =~ ${adv_regex} ]]; then
             die "Invalid advanced country syntax. Use format like 'provider:C1,C2;provider2:C3'"
         fi
+
+        local group provider
+        local -a provider_groups
+        IFS=';' read -r -a provider_groups <<<"${ALLOWED_COUNTRIES}"
+        for group in "${provider_groups[@]}"; do
+            provider="${group%%:*}"
+            provider="${provider,,}"
+            [[ " ${ALLOWED_PROVIDERS[*]} " == *" ${provider} "* ]] ||
+                die "Invalid provider '${provider}'. Allowed: ${ALLOWED_PROVIDERS[*]}"
+        done
     else
         # Simple syntax (e.g., "IT,FR,DE")
         if [[ ! "${ALLOWED_COUNTRIES}" =~ ^[A-Za-z]{2}(,[A-Za-z]{2})*$ ]]; then
             die "Country codes must be 2-letter ISO codes, comma-separated (e.g., IT,FR,DE)"
         fi
+
+        [[ " ${ALLOWED_PROVIDERS[*]} " == *" ${GEO_IP_PROVIDER} "* ]] ||
+            die "Invalid provider '${GEO_IP_PROVIDER}'. Allowed: ${ALLOWED_PROVIDERS[*]}"
+        log "INFO" "Using Geo-IP provider: ${GEO_IP_PROVIDER}"
     fi
-    # Validate provider against known providers array
-    local _valid_provider=false
-    for _p in "${ALLOWED_PROVIDERS[@]}"; do
-        [[ "${GEO_IP_PROVIDER}" == "${_p}" ]] && _valid_provider=true && break
-    done
-    [[ "${_valid_provider}" == true ]] || die "Invalid provider '${GEO_IP_PROVIDER}'. Allowed: ${ALLOWED_PROVIDERS[*]}"
-    log "INFO" "Using Geo-IP provider: ${GEO_IP_PROVIDER}"
 }
 
 ###################
@@ -512,7 +582,7 @@ check_connectivity() {
             local resolve_opts_str=""
             if [[ -n "${DNS_SERVERS:-}" ]]; then
                 build_resolve_options_for_url "https://${site}" resolve_opts_str
-                [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<< "${resolve_opts_str}"
+                [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<<"${resolve_opts_str}"
             fi
 
             # -f: fail on HTTP error  --head: no body download
@@ -546,7 +616,7 @@ detect_backend() {
         # Pre-flight check: Verify nftables functionality
         # This catches issues like missing kernel modules or permission errors early.
         if ! nft list tables >/dev/null 2>&1; then
-             die "nftables detected but 'nft list tables' failed. Check kernel support or permissions."
+            die "nftables detected but 'nft list tables' failed. Check kernel support or permissions."
         fi
 
     elif command -v iptables &>/dev/null && command -v ipset &>/dev/null; then
@@ -555,7 +625,7 @@ detect_backend() {
         REQUIRED_COMMANDS=(curl ipset iptables iprange iptables-restore iptables-save grep sed awk cp getent)
         [[ "${USE_BLOCKLIST}" == true ]] && REQUIRED_COMMANDS+=(cksum)
         if [[ "${GEOBLOCK_IPV6}" == true ]]; then
-             REQUIRED_COMMANDS+=(ip6tables ip6tables-restore ip6tables-save)
+            REQUIRED_COMMANDS+=(ip6tables ip6tables-restore ip6tables-save)
         fi
         log "INFO" "Backend selected: iptables (legacy)"
     else
@@ -633,7 +703,7 @@ restore_iptables_backup() {
 
     [[ -s "${backup_file}" ]] || return 1
 
-    if "${restore_cmd}" < "${backup_file}"; then
+    if "${restore_cmd}" <"${backup_file}"; then
         log "INFO" "Rollback successful for ${label}."
         return 0
     fi
@@ -684,9 +754,9 @@ backup_ipset_state() {
     local backup_file="$2"
 
     if ipset list "${set_name}" >/dev/null 2>&1; then
-        ipset save "${set_name}" > "${backup_file}" || die "Failed to back up ipset '${set_name}'"
+        ipset save "${set_name}" >"${backup_file}" || die "Failed to back up ipset '${set_name}'"
     else
-        : > "${backup_file}"
+        : >"${backup_file}"
     fi
 }
 
@@ -703,12 +773,12 @@ restore_ipset_backup() {
                 next
             }
             $1 == "add" { print }
-        ' "${backup_file}" > "${restore_file}"; then
+        ' "${backup_file}" >"${restore_file}"; then
             log "ERROR" "Failed to prepare rollback payload for ipset '${set_name}'."
             return 1
         fi
 
-        if ipset restore < "${restore_file}"; then
+        if ipset restore <"${restore_file}"; then
             log "INFO" "Rollback successful for ipset '${set_name}'."
             return 0
         fi
@@ -768,7 +838,7 @@ rollback_iptables_runtime_state() {
 
     restore_ipset_backup "${ALLOW_LIST_NAME_V4}" "${ipset_backup_v4}" || rollback_failed=1
 
-    if [[ -n "${ipset_backup_v6}" && ( -s "${ipset_backup_v6}" || "${GEOBLOCK_IPV6}" == true ) ]]; then
+    if [[ -n "${ipset_backup_v6}" && (-s "${ipset_backup_v6}" || "${GEOBLOCK_IPV6}" == true) ]]; then
         restore_ipset_backup "${ALLOW_LIST_NAME_V6}" "${ipset_backup_v6}" || rollback_failed=1
     fi
 
@@ -877,7 +947,7 @@ download_blocklists() {
     local index_resolve_opts_str=""
     if [[ -n "${DNS_SERVERS:-}" ]]; then
         build_resolve_options_for_url "${BLOCK_LIST_URL}" index_resolve_opts_str
-        [[ -n "${index_resolve_opts_str}" ]] && read -ra index_resolve_opts <<< "${index_resolve_opts_str}"
+        [[ -n "${index_resolve_opts_str}" ]] && read -ra index_resolve_opts <<<"${index_resolve_opts_str}"
     fi
 
     if ! try_command curl -fsSL "${index_resolve_opts[@]}" --connect-timeout 10 --max-time 30 "${BLOCK_LIST_URL}" -o "${BLOCK_LIST_FILE_NAME}"; then
@@ -893,7 +963,7 @@ download_blocklists() {
         [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
         line="${line//$'\r'/}"
         urls+=("${line}")
-    done < "${BLOCK_LIST_FILE_NAME}"
+    done <"${BLOCK_LIST_FILE_NAME}"
 
     # 2. Parse additional manual blocklist sources (canonical path first).
     if [[ -f "${MANUAL_BLOCK_SOURCES_FILE}" ]]; then
@@ -902,7 +972,7 @@ download_blocklists() {
             [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
             line="${line//$'\r'/}"
             urls+=("${line}")
-        done < "${MANUAL_BLOCK_SOURCES_FILE}"
+        done <"${MANUAL_BLOCK_SOURCES_FILE}"
     fi
 
     if [[ -f "${LEGACY_MANUAL_BLOCK_SOURCES_FILE}" ]]; then
@@ -911,7 +981,7 @@ download_blocklists() {
             [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
             line="${line//$'\r'/}"
             urls+=("${line}")
-        done < "${LEGACY_MANUAL_BLOCK_SOURCES_FILE}"
+        done <"${LEGACY_MANUAL_BLOCK_SOURCES_FILE}"
     fi
 
     for url in "${urls[@]}"; do
@@ -955,7 +1025,7 @@ download_blocklists() {
                 local url="${scheduled_files[${cache_name}]}"
                 if [[ -n "${DNS_SERVERS:-}" ]]; then
                     build_resolve_options_for_url "${url}" resolve_opts_str
-                    [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<< "${resolve_opts_str}"
+                    [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<<"${resolve_opts_str}"
                 fi
 
                 log "INFO" "Downloading: ${url}"
@@ -995,7 +1065,7 @@ download_blocklists() {
         missing_blocklist_files+=("${cache_name}")
     done
 
-    failed=$(( total - ok ))
+    failed=$((total - ok))
     if ((${#missing_blocklist_files[@]} > 0)); then
         shopt -s nullglob
         local cached=("${BLOCK_LIST_DIR}"/*)
@@ -1019,7 +1089,7 @@ download_blocklists() {
 # shellcheck disable=SC2310
 separate_ip_families() {
     log "INFO" "Separating IPv4 and IPv6 addresses from raw blocklists..."
-    
+
     # Enable nullglob to handle empty dirs
     shopt -s nullglob
     local raw_files=("${BLOCK_LIST_DIR}"/*)
@@ -1156,7 +1226,7 @@ separate_ip_families() {
 
     BLOCK_LIST_CLEAN_V4_DIR="${BLOCK_LIST_DIR_V4}"
     BLOCK_LIST_CLEAN_V6_DIR="${BLOCK_LIST_DIR_V6}"
-    
+
     log "INFO" "Separation complete."
 }
 
@@ -1304,7 +1374,7 @@ download_manual_allow_sources() {
             [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
             line="${line//$'\r'/}"
             urls+=("${line}")
-        done < "${MANUAL_ALLOW_SOURCES_FILE}"
+        done <"${MANUAL_ALLOW_SOURCES_FILE}"
     fi
 
     if [[ -f "${LEGACY_MANUAL_ALLOW_SOURCES_FILE}" ]]; then
@@ -1313,7 +1383,7 @@ download_manual_allow_sources() {
             [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
             line="${line//$'\r'/}"
             urls+=("${line}")
-        done < "${LEGACY_MANUAL_ALLOW_SOURCES_FILE}"
+        done <"${LEGACY_MANUAL_ALLOW_SOURCES_FILE}"
     fi
 
     if [[ ${#urls[@]} -eq 0 ]]; then
@@ -1336,7 +1406,7 @@ download_manual_allow_sources() {
         local resolve_opts_str=""
         if [[ -n "${DNS_SERVERS:-}" ]]; then
             build_resolve_options_for_url "${url}" resolve_opts_str
-            [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<< "${resolve_opts_str}"
+            [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<<"${resolve_opts_str}"
         fi
 
         if curl -fsSL "${resolve_opts[@]}" -o "${temp_file}" --connect-timeout 15 --max-time 90 "${url}" 2>/dev/null; then
@@ -1396,7 +1466,7 @@ resolve_domain_family_to_file() {
     rm -f "${output_file}"
 
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        read -ra servers <<< "${DNS_SERVERS}"
+        read -ra servers <<<"${DNS_SERVERS}"
         for ns in "${servers[@]}"; do
             if [[ "${family}" == "A" ]]; then
                 if ! resolved_output=$(dig +short "@${ns}" "${domain}" A 2>/dev/null |
@@ -1410,9 +1480,9 @@ resolve_domain_family_to_file() {
                 fi
             fi
             resolved=()
-            [[ -z "${resolved_output}" ]] || mapfile -t resolved <<< "${resolved_output}"
+            [[ -z "${resolved_output}" ]] || mapfile -t resolved <<<"${resolved_output}"
             if ((${#resolved[@]} > 0)); then
-                printf '%s\n' "${resolved[@]}" > "${output_file}"
+                printf '%s\n' "${resolved[@]}" >"${output_file}"
                 return 0
             fi
         done
@@ -1420,12 +1490,15 @@ resolve_domain_family_to_file() {
     fi
 
     if [[ "${family}" == "A" ]]; then
-        getent ahostsv4 "${domain}" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ && !seen[$1]++ { print $1 }' > "${output_file}" || true
+        getent ahostsv4 "${domain}" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ && !seen[$1]++ { print $1 }' >"${output_file}" || true
     else
-        getent ahostsv6 "${domain}" 2>/dev/null | awk '$1 ~ /:/ && !seen[$1]++ { print $1 }' > "${output_file}" || true
+        getent ahostsv6 "${domain}" 2>/dev/null | awk '$1 ~ /:/ && !seen[$1]++ { print $1 }' >"${output_file}" || true
     fi
 
-    [[ -s "${output_file}" ]] || { rm -f "${output_file}"; return 1; }
+    [[ -s "${output_file}" ]] || {
+        rm -f "${output_file}"
+        return 1
+    }
     return 0
 }
 
@@ -1455,7 +1528,7 @@ refresh_manual_domain_cache() {
         line="${line//$'\r'/}"
         line="${line%%#*}"
         line="${line%%;*}"
-        read -r domain family extra <<< "${line}"
+        read -r domain family extra <<<"${line}"
         [[ -z "${domain:-}" ]] && continue
         [[ -z "${extra:-}" ]] || die "Invalid manual ${label} domain entry '${line}'. Use: hostname [A|AAAA|BOTH]"
 
@@ -1463,7 +1536,7 @@ refresh_manual_domain_cache() {
         family="${family^^}"
         [[ -n "${family}" ]] || family="BOTH"
         case "${family}" in
-            A|AAAA|BOTH) ;;
+            A | AAAA | BOTH) ;;
             *) die "Invalid address family '${family}' for manual ${label} domain '${domain}'. Use A, AAAA, or BOTH." ;;
         esac
 
@@ -1495,7 +1568,7 @@ refresh_manual_domain_cache() {
         fi
 
         [[ "${any_satisfied}" == true ]] || die "Failed to resolve manual ${label} domain '${domain}' for every requested family and no cache exists."
-    done < "${domains_file}"
+    done <"${domains_file}"
 
     atomic_swap_directory "${stage_v4}" "${cache_dir_v4}" "${TEMP_DIR}/${label}_domains_v4.backup"
     atomic_swap_directory "${stage_v6}" "${cache_dir_v6}" "${TEMP_DIR}/${label}_domains_v6.backup"
@@ -1558,8 +1631,8 @@ generate_ip_list() {
     local effective_stage_v4="${TEMP_DIR}/effective_allow_stage.v4"
     local effective_stage_v6="${TEMP_DIR}/effective_allow_stage.v6"
     mkdir -p "${merged_allow_dir_v4}" "${merged_allow_dir_v6}" "${final_allow_dir_v4}" "${final_allow_dir_v6}" \
-        "${final_block_dir_v4}" "${final_block_dir_v6}" \
-        || die "Failed to prepare merged allowlist directories."
+        "${final_block_dir_v4}" "${final_block_dir_v6}" ||
+        die "Failed to prepare merged allowlist directories."
 
     # --- Optimize IPv4 List ---
     if [[ "${USE_BLOCKLIST}" == true && -d "${BLOCK_LIST_CLEAN_V4_DIR}" ]] && compgen -G "${BLOCK_LIST_CLEAN_V4_DIR%/}/*" >/dev/null; then
@@ -1611,13 +1684,13 @@ generate_ip_list() {
         ((nullglob_was_enabled == 1)) || shopt -u nullglob
         return
     fi
-    
+
     if [[ "${USE_BLOCKLIST}" == true && -d "${BLOCK_LIST_CLEAN_V6_DIR}" ]] && compgen -G "${BLOCK_LIST_CLEAN_V6_DIR%/}/*" >/dev/null; then
         log "INFO" "Building IPv6 allow base with remote blocklist subtraction..."
-        "${iprange_cmd_v6[@]}" -6 @"${ALLOW_LIST_DIR_V6}" --except @"${BLOCK_LIST_CLEAN_V6_DIR}" > "${generated_stage_v6}"
+        "${iprange_cmd_v6[@]}" -6 @"${ALLOW_LIST_DIR_V6}" --except @"${BLOCK_LIST_CLEAN_V6_DIR}" >"${generated_stage_v6}"
     else
         log "INFO" "Building IPv6 allow base..."
-        "${iprange_cmd_v6[@]}" -6 @"${ALLOW_LIST_DIR_V6}" > "${generated_stage_v6}"
+        "${iprange_cmd_v6[@]}" -6 @"${ALLOW_LIST_DIR_V6}" >"${generated_stage_v6}"
     fi
 
     if [[ -s "${generated_stage_v6}" ]]; then
@@ -1641,7 +1714,7 @@ generate_ip_list() {
     fi
 
     log "INFO" "Optimizing IPv6 allow lists..."
-    "${iprange_cmd_v6[@]}" -6 @"${merged_allow_dir_v6}" > "${effective_stage_v6}"
+    "${iprange_cmd_v6[@]}" -6 @"${merged_allow_dir_v6}" >"${effective_stage_v6}"
     if [[ ! -s "${effective_stage_v6}" ]]; then
         log "WARN" "Merged IPv6 allowlist is empty. IPv6 Geo-IP will not be active."
         ((nullglob_was_enabled == 1)) || shopt -u nullglob
@@ -1653,7 +1726,7 @@ generate_ip_list() {
     copy_directory_contents_if_present "${MANUAL_BLOCK_LIST_DIR_V6}" "${final_block_dir_v6}"
     if directory_has_files "${final_block_dir_v6}"; then
         log "INFO" "Applying manual IPv6 blocklist veto..."
-        "${iprange_cmd_v6[@]}" -6 @"${final_allow_dir_v6}" --except @"${final_block_dir_v6}" > "${IP_RANGE_FILE_V6}"
+        "${iprange_cmd_v6[@]}" -6 @"${final_allow_dir_v6}" --except @"${final_block_dir_v6}" >"${IP_RANGE_FILE_V6}"
     else
         cp -f "${effective_stage_v6}" "${IP_RANGE_FILE_V6}"
     fi
@@ -1700,9 +1773,9 @@ populate_ipset() {
         echo "create ${set_name} hash:net family ${family} -exist"
         echo "flush ${set_name}"
         sed "s/^/add ${set_name} /" "${range_file}"
-    } > "${restore_file}"
+    } >"${restore_file}"
 
-    ipset restore < "${restore_file}" || die "Failed to restore ipset '${set_name}'"
+    ipset restore <"${restore_file}" || die "Failed to restore ipset '${set_name}'"
     log "INFO" "ipset '${set_name}' populated."
 }
 
@@ -1716,15 +1789,15 @@ apply_rules_iptables() {
     local ip6tables_backup_file="${TEMP_DIR}/ip6tables.backup"
     local ipset_backup_v4="${TEMP_DIR}/${ALLOW_LIST_NAME_V4}.ipset.backup"
     local ipset_backup_v6="${TEMP_DIR}/${ALLOW_LIST_NAME_V6}.ipset.backup"
-    iptables-save > "${iptables_backup_file}" || die "Failed to back up current iptables rules"
+    iptables-save >"${iptables_backup_file}" || die "Failed to back up current iptables rules"
     if command -v ip6tables-save >/dev/null 2>&1; then
-        ip6tables-save > "${ip6tables_backup_file}" || die "Failed to back up current ip6tables rules"
+        ip6tables-save >"${ip6tables_backup_file}" || die "Failed to back up current ip6tables rules"
     fi
     backup_ipset_state "${ALLOW_LIST_NAME_V4}" "${ipset_backup_v4}"
     if [[ "${GEOBLOCK_IPV6}" == true ]]; then
         backup_ipset_state "${ALLOW_LIST_NAME_V6}" "${ipset_backup_v6}"
     else
-        : > "${ipset_backup_v6}"
+        : >"${ipset_backup_v6}"
     fi
 
     # 1. Populate IPv4 ipset
@@ -1732,132 +1805,132 @@ apply_rules_iptables() {
 
     # 2. Cleanup Old Rules (Mangle + Filter + NAT)
     log "INFO" "Cleaning up old iptables rules and chains..."
-    cleanup_iptables_chain iptables mangle  PREROUTING  LABO_PREROUTING
-    cleanup_iptables_chain iptables filter  INPUT       LABO_INPUT
-    cleanup_iptables_chain iptables filter  DOCKER-USER LABO_DOCKER_USER
-    cleanup_iptables_chain iptables nat     POSTROUTING LABO_POSTROUTING
+    cleanup_iptables_chain iptables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING
+    cleanup_iptables_chain iptables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT
+    cleanup_iptables_chain iptables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER
+    cleanup_iptables_chain iptables nat POSTROUTING "${IPTABLES_CHAIN_PREFIX}"_POSTROUTING
 
     # 3. Apply IPv4 Rules (Atomic Restore)
     # We use *mangle for PREROUTING (Gatekeeper) and *filter for INPUT/FORWARD protection.
     local iptables_rules_file="${TEMP_DIR}/iptables.rules"
-    cat > "${iptables_rules_file}" <<-EOF
+    cat >"${iptables_rules_file}" <<-EOF
 *mangle
-:LABO_PREROUTING - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_PREROUTING - [0:0]
 
-# --- LABO_PREROUTING Chain (Gatekeeper) ---
+# --- ${IPTABLES_CHAIN_PREFIX}_PREROUTING Chain (Gatekeeper) ---
 # Equivalent to nftables 'prerouting' hook.
 # Filters traffic BEFORE routing decisions.
 
 # 1. Drop Invalid
--A LABO_PREROUTING -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -m state --state INVALID -j DROP
 
 # 2. Optimization: Accept Established/Related immediately
--A LABO_PREROUTING -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # 3. Critical System & Local Traffic
--A LABO_PREROUTING -i lo -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -i lo -j ACCEPT
 # In iptables, '+' is the wildcard (equivalent to '*' in nft/shell)
--A LABO_PREROUTING -i docker0 -j ACCEPT
--A LABO_PREROUTING -i br+ -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -i docker0 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -i br+ -j ACCEPT
 # WireGuard interfaces (inner traffic)
--A LABO_PREROUTING -i wg+ -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -i wg+ -j ACCEPT
 
 # 4. Accept Private Networks (Bypass GeoIP)
--A LABO_PREROUTING -s 10.0.0.0/8 -j ACCEPT
--A LABO_PREROUTING -s 172.16.0.0/12 -j ACCEPT
--A LABO_PREROUTING -s 192.168.0.0/16 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -s 10.0.0.0/8 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -s 172.16.0.0/12 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -s 192.168.0.0/16 -j ACCEPT
 
 # 5. Geo-IP Filter (DROP)
 # Drop NEW traffic not in allowlist
--A LABO_PREROUTING -m set ! --match-set ${ALLOW_LIST_NAME_V4} src -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -m set ! --match-set ${ALLOW_LIST_NAME_V4} src -j DROP
 
 # 6. Default: Accept (Pass to next table)
--A LABO_PREROUTING -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING -j ACCEPT
 COMMIT
 
 *filter
-:LABO_INPUT - [0:0]
-:LABO_DOCKER_USER - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_INPUT - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_DOCKER_USER - [0:0]
 
-# --- LABO_INPUT Chain (Host Protection) ---
+# --- ${IPTABLES_CHAIN_PREFIX}_INPUT Chain (Host Protection) ---
 # Traffic has already passed GeoIP in mangle table.
 
--A LABO_INPUT -m state --state INVALID -j DROP
--A LABO_INPUT -i lo -j ACCEPT
--A LABO_INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
--A LABO_INPUT -s 10.0.0.0/8 -j ACCEPT
--A LABO_INPUT -s 172.16.0.0/12 -j ACCEPT
--A LABO_INPUT -s 192.168.0.0/16 -j ACCEPT
--A LABO_INPUT -p icmp -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -i lo -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -s 10.0.0.0/8 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -s 172.16.0.0/12 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -s 192.168.0.0/16 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -p icmp -j ACCEPT
 
 # Trust local interfaces
--A LABO_INPUT -i docker0 -j ACCEPT
--A LABO_INPUT -i br+ -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -i docker0 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -i br+ -j ACCEPT
 # Trust WireGuard interfaces
--A LABO_INPUT -i wg+ -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -i wg+ -j ACCEPT
 
 # SSH Brute Force Mitigation (IPv4)
 # Drop new connections from a source IP exceeding 10/second.
 # Uses hashlimit (same module as IPv6) for consistency across all backends.
--A LABO_INPUT -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v4_limit --hashlimit-mode srcip --hashlimit-above 10/second -j LOG --log-prefix "SSH BRUTE DROP: "
--A LABO_INPUT -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v4_limit --hashlimit-mode srcip --hashlimit-above 10/second -j DROP
--A LABO_INPUT -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v4_limit --hashlimit-mode srcip --hashlimit-above 10/second -j LOG --log-prefix "SSH BRUTE DROP: "
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v4_limit --hashlimit-mode srcip --hashlimit-above 10/second -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT -j ACCEPT
 
-# --- LABO_DOCKER_USER Chain (Forwarding) ---
+# --- ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER Chain (Forwarding) ---
 # Protects Docker containers.
 # Mirrors the 'FORWARD' chain logic in nftables.
 
--A LABO_DOCKER_USER -m state --state INVALID -j DROP
--A LABO_DOCKER_USER -m state --state RELATED,ESTABLISHED -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -m state --state RELATED,ESTABLISHED -j RETURN
 
 # Explicitly trust Docker interfaces (using '+' wildcard)
--A LABO_DOCKER_USER -i docker0 -j RETURN
--A LABO_DOCKER_USER -o docker0 -j RETURN
--A LABO_DOCKER_USER -i br+ -j RETURN
--A LABO_DOCKER_USER -o br+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -i docker0 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -o docker0 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -i br+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -o br+ -j RETURN
 # Explicitly trust WireGuard interfaces
--A LABO_DOCKER_USER -i wg+ -j RETURN
--A LABO_DOCKER_USER -o wg+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -i wg+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -o wg+ -j RETURN
 
 # Private Nets & Loopback
--A LABO_DOCKER_USER -i lo -j RETURN
--A LABO_DOCKER_USER -s 10.0.0.0/8 -j RETURN
--A LABO_DOCKER_USER -s 172.16.0.0/12 -j RETURN
--A LABO_DOCKER_USER -s 192.168.0.0/16 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -i lo -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -s 10.0.0.0/8 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -s 172.16.0.0/12 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -s 192.168.0.0/16 -j RETURN
 
 # Note: GeoIP dropping happened in 'mangle' table.
 # If we reached here, the packet is valid or established.
--A LABO_DOCKER_USER -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER -j RETURN
 COMMIT
 
 *nat
-:LABO_POSTROUTING - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_POSTROUTING - [0:0]
 
-# --- LABO_POSTROUTING Chain (Masquerade) ---
+# --- ${IPTABLES_CHAIN_PREFIX}_POSTROUTING Chain (Masquerade) ---
 EOF
     # Generate masquerade rules from constant
     for iface in "${NAT_INTERFACES[@]}"; do
         # iptables uses '+' as wildcard instead of '*'
-        echo "-A LABO_POSTROUTING -o ${iface//\*/+} -j MASQUERADE" >> "${iptables_rules_file}"
+        echo "-A ${IPTABLES_CHAIN_PREFIX}_POSTROUTING -o ${iface//\*/+} -j MASQUERADE" >>"${iptables_rules_file}"
     done
-    cat >> "${iptables_rules_file}" <<-EOF
+    cat >>"${iptables_rules_file}" <<-EOF
 COMMIT
 EOF
 
     # Apply Rules
-    if ! iptables-restore --noflush < "${iptables_rules_file}"; then
+    if ! iptables-restore --noflush <"${iptables_rules_file}"; then
         log "ERROR" "Failed to apply iptables rules. Restoring previous ruleset..."
         rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
         die "Failed to apply iptables rules"
     fi
 
     # Hook into system chains
-    if ! iptables -t mangle -I PREROUTING 1 -j LABO_PREROUTING; then
+    if ! iptables -t mangle -I PREROUTING 1 -j "${IPTABLES_CHAIN_PREFIX}"_PREROUTING; then
         log "ERROR" "Failed to install PREROUTING hook. Restoring previous iptables ruleset..."
         rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
         die "Failed to install PREROUTING hook"
     fi
-    if ! iptables -I INPUT 1 -j LABO_INPUT; then
+    if ! iptables -I INPUT 1 -j "${IPTABLES_CHAIN_PREFIX}"_INPUT; then
         log "ERROR" "Failed to install INPUT hook. Restoring previous iptables ruleset..."
         rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
         die "Failed to install INPUT hook"
@@ -1865,7 +1938,7 @@ EOF
     # DOCKER-USER is created by the Docker daemon on startup; it does not exist
     # on systems without Docker or when the daemon is stopped.
     if iptables -L DOCKER-USER >/dev/null 2>&1; then
-        if ! iptables -I DOCKER-USER 1 -j LABO_DOCKER_USER; then
+        if ! iptables -I DOCKER-USER 1 -j "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER; then
             log "ERROR" "Failed to install DOCKER-USER hook. Restoring previous iptables ruleset..."
             rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
             die "Failed to install DOCKER-USER hook"
@@ -1873,7 +1946,7 @@ EOF
     else
         log "WARN" "iptables DOCKER-USER chain not found (Docker not running?). Container FORWARD protection inactive."
     fi
-    if ! iptables -t nat -I POSTROUTING 1 -j LABO_POSTROUTING; then
+    if ! iptables -t nat -I POSTROUTING 1 -j "${IPTABLES_CHAIN_PREFIX}"_POSTROUTING; then
         log "ERROR" "Failed to install POSTROUTING hook. Restoring previous iptables ruleset..."
         rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
         die "Failed to install POSTROUTING hook"
@@ -1889,86 +1962,86 @@ EOF
 
             # Cleanup IPv6
             log "INFO" "Cleaning up old ip6tables rules..."
-            cleanup_iptables_chain ip6tables mangle  PREROUTING  LABO_PREROUTING_V6
-            cleanup_iptables_chain ip6tables filter  INPUT       LABO_INPUT_V6
-            cleanup_iptables_chain ip6tables filter  DOCKER-USER LABO_DOCKER_USER_V6
+            cleanup_iptables_chain ip6tables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING_V6
+            cleanup_iptables_chain ip6tables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT_V6
+            cleanup_iptables_chain ip6tables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER_V6
 
             local ip6tables_rules_file="${TEMP_DIR}/ip6tables.rules"
-            cat > "${ip6tables_rules_file}" <<-EOF
+            cat >"${ip6tables_rules_file}" <<-EOF
 *mangle
-:LABO_PREROUTING_V6 - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 - [0:0]
 
-# --- LABO_PREROUTING_V6 (Gatekeeper) ---
--A LABO_PREROUTING_V6 -m state --state INVALID -j DROP
--A LABO_PREROUTING_V6 -m state --state RELATED,ESTABLISHED -j ACCEPT
--A LABO_PREROUTING_V6 -i lo -j ACCEPT
--A LABO_PREROUTING_V6 -i docker0 -j ACCEPT
--A LABO_PREROUTING_V6 -i br+ -j ACCEPT
--A LABO_PREROUTING_V6 -i wg+ -j ACCEPT
+# --- ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 (Gatekeeper) ---
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -i lo -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -i docker0 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -i br+ -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -i wg+ -j ACCEPT
 
 # Accept Private & Multicast
--A LABO_PREROUTING_V6 -s fe80::/10 -j ACCEPT
--A LABO_PREROUTING_V6 -s fc00::/7 -j ACCEPT
--A LABO_PREROUTING_V6 -s ff00::/8 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -s fe80::/10 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -s fc00::/7 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -s ff00::/8 -j ACCEPT
 
 # CRITICAL: ICMPv6 must be accepted before GeoIP
--A LABO_PREROUTING_V6 -p icmpv6 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -p icmpv6 -j ACCEPT
 
 # Geo-IP Filter (DROP)
--A LABO_PREROUTING_V6 -m set ! --match-set ${ALLOW_LIST_NAME_V6} src -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -m set ! --match-set ${ALLOW_LIST_NAME_V6} src -j DROP
 
--A LABO_PREROUTING_V6 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_PREROUTING_V6 -j ACCEPT
 COMMIT
 
 *filter
-:LABO_INPUT_V6 - [0:0]
-:LABO_DOCKER_USER_V6 - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_INPUT_V6 - [0:0]
+:${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 - [0:0]
 
-# --- LABO_INPUT_V6 ---
--A LABO_INPUT_V6 -m state --state INVALID -j DROP
--A LABO_INPUT_V6 -m state --state RELATED,ESTABLISHED -j ACCEPT
--A LABO_INPUT_V6 -i lo -j ACCEPT
--A LABO_INPUT_V6 -s fe80::/10 -j ACCEPT
--A LABO_INPUT_V6 -p icmpv6 -j ACCEPT
--A LABO_INPUT_V6 -i wg+ -j ACCEPT
+# --- ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 ---
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -i lo -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -s fe80::/10 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -p icmpv6 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -i wg+ -j ACCEPT
 
 # SSH Rate Limit (IPv6)
--A LABO_INPUT_V6 -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v6_limit --hashlimit-mode srcip --hashlimit-above 10/second -j LOG --log-prefix "IP6 SSH RATE-DROP: "
--A LABO_INPUT_V6 -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v6_limit --hashlimit-mode srcip --hashlimit-above 10/second -j DROP
--A LABO_INPUT_V6 -j ACCEPT
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v6_limit --hashlimit-mode srcip --hashlimit-above 10/second -j LOG --log-prefix "IP6 SSH RATE-DROP: "
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -p tcp --dport ${SSH_PORT} -m hashlimit --hashlimit-name ssh_v6_limit --hashlimit-mode srcip --hashlimit-above 10/second -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_INPUT_V6 -j ACCEPT
 
-# --- LABO_DOCKER_USER_V6 ---
--A LABO_DOCKER_USER_V6 -m state --state INVALID -j DROP
--A LABO_DOCKER_USER_V6 -m state --state RELATED,ESTABLISHED -j RETURN
--A LABO_DOCKER_USER_V6 -i lo -j RETURN
--A LABO_DOCKER_USER_V6 -i docker0 -j RETURN
--A LABO_DOCKER_USER_V6 -o docker0 -j RETURN
--A LABO_DOCKER_USER_V6 -i br+ -j RETURN
--A LABO_DOCKER_USER_V6 -o br+ -j RETURN
--A LABO_DOCKER_USER_V6 -i wg+ -j RETURN
--A LABO_DOCKER_USER_V6 -o wg+ -j RETURN
--A LABO_DOCKER_USER_V6 -s fe80::/10 -j RETURN
--A LABO_DOCKER_USER_V6 -j RETURN
+# --- ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 ---
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -m state --state INVALID -j DROP
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -m state --state RELATED,ESTABLISHED -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -i lo -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -i docker0 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -o docker0 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -i br+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -o br+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -i wg+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -o wg+ -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -s fe80::/10 -j RETURN
+-A ${IPTABLES_CHAIN_PREFIX}_DOCKER_USER_V6 -j RETURN
 COMMIT
 EOF
-            if ! ip6tables-restore --noflush < "${ip6tables_rules_file}"; then
+            if ! ip6tables-restore --noflush <"${ip6tables_rules_file}"; then
                 log "ERROR" "Failed to apply ip6tables rules. Restoring previous IPv6 ruleset..."
                 rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
                 die "Failed to apply ip6tables rules"
             fi
 
-            if ! ip6tables -t mangle -I PREROUTING 1 -j LABO_PREROUTING_V6; then
+            if ! ip6tables -t mangle -I PREROUTING 1 -j "${IPTABLES_CHAIN_PREFIX}"_PREROUTING_V6; then
                 log "ERROR" "Failed to install IPv6 PREROUTING hook. Restoring previous IPv6 ruleset..."
                 rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
                 die "Failed to install IPv6 PREROUTING hook"
             fi
-            if ! ip6tables -I INPUT 1 -j LABO_INPUT_V6; then
+            if ! ip6tables -I INPUT 1 -j "${IPTABLES_CHAIN_PREFIX}"_INPUT_V6; then
                 log "ERROR" "Failed to install IPv6 INPUT hook. Restoring previous IPv6 ruleset..."
                 rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
                 die "Failed to install IPv6 INPUT hook"
             fi
             if ip6tables -L DOCKER-USER >/dev/null 2>&1; then
-                if ! ip6tables -I DOCKER-USER 1 -j LABO_DOCKER_USER_V6; then
+                if ! ip6tables -I DOCKER-USER 1 -j "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER_V6; then
                     log "ERROR" "Failed to install IPv6 DOCKER-USER hook. Restoring previous IPv6 ruleset..."
                     rollback_iptables_runtime_state "${iptables_backup_file}" "${ip6tables_backup_file}" "${ipset_backup_v4}" "${ipset_backup_v6}" || true
                     die "Failed to install IPv6 DOCKER-USER hook"
@@ -1980,18 +2053,18 @@ EOF
             log "INFO" "ip6tables (IPv6) rules applied successfully."
         else
             log "WARN" "IPv6 range file is empty. Skipping IPv6 rule application."
-            cleanup_iptables_chain ip6tables mangle  PREROUTING  LABO_PREROUTING_V6
-            cleanup_iptables_chain ip6tables filter  INPUT       LABO_INPUT_V6
-            cleanup_iptables_chain ip6tables filter  DOCKER-USER LABO_DOCKER_USER_V6
+            cleanup_iptables_chain ip6tables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING_V6
+            cleanup_iptables_chain ip6tables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT_V6
+            cleanup_iptables_chain ip6tables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER_V6
             cleanup_legacy_ipset "${ALLOW_LIST_NAME_V6}" || true
         fi
     else
         # Flush if IPv6 GeoBlocking is disabled but backend is iptables
         if command -v ip6tables &>/dev/null; then
-             log "INFO" "Flushing IPv6 rules (Geo-blocking disabled)..."
-             cleanup_iptables_chain ip6tables mangle  PREROUTING  LABO_PREROUTING_V6
-             cleanup_iptables_chain ip6tables filter  INPUT       LABO_INPUT_V6
-             cleanup_iptables_chain ip6tables filter  DOCKER-USER LABO_DOCKER_USER_V6
+            log "INFO" "Flushing IPv6 rules (Geo-blocking disabled)..."
+            cleanup_iptables_chain ip6tables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING_V6
+            cleanup_iptables_chain ip6tables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT_V6
+            cleanup_iptables_chain ip6tables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER_V6
         fi
         cleanup_legacy_ipset "${ALLOW_LIST_NAME_V6}" || true
     fi
@@ -2020,10 +2093,10 @@ apply_rules_nftables() {
     local v4_elements_file="${TEMP_DIR}/v4_elements.nft"
     if [[ -s "${IP_RANGE_FILE_V4}" ]]; then
         # Convert newlines to commas
-        paste -s -d, "${IP_RANGE_FILE_V4}" > "${v4_elements_file}"
+        paste -s -d, "${IP_RANGE_FILE_V4}" >"${v4_elements_file}"
     else
         log "WARN" "IPv4 range file is empty. Using dummy IP."
-        echo "192.0.2.1" > "${v4_elements_file}" # RFC 5737 TEST-NET-1
+        echo "192.0.2.1" >"${v4_elements_file}" # RFC 5737 TEST-NET-1
     fi
 
     local v6_elements_file="${TEMP_DIR}/v6_elements.nft"
@@ -2031,12 +2104,12 @@ apply_rules_nftables() {
         # Process Allowlist
         if [[ -s "${IP_RANGE_FILE_V6}" ]]; then
             # Filter valid IPv6 chars only (hex, colon, slash) and join
-            grep -E '^[0-9a-fA-F:/]+$' "${IP_RANGE_FILE_V6}" | paste -s -d, > "${v6_elements_file}" || true
+            grep -E '^[0-9a-fA-F:/]+$' "${IP_RANGE_FILE_V6}" | paste -s -d, >"${v6_elements_file}" || true
         fi
         # Ensure Allowlist is securely set before application
         if [[ ! -s "${v6_elements_file}" ]]; then
             log "WARN" "IPv6 allowlist is empty (or containing only invalid entries). Using dummy IP."
-            echo "2001:db8::1" > "${v6_elements_file}"  # RFC 3849 documentation prefix
+            echo "2001:db8::1" >"${v6_elements_file}" # RFC 3849 documentation prefix
         fi
     fi
 
@@ -2054,8 +2127,10 @@ apply_rules_nftables() {
     (
         # Derive nftables set elements from the PRIVATE_NETS_* constants (single source of truth).
         local priv_v4_elems priv_v6_elems
-        priv_v4_elems=$(printf "%s, " "${PRIVATE_NETS_V4[@]}"); priv_v4_elems="${priv_v4_elems%, }"
-        priv_v6_elems=$(printf "%s, " "${PRIVATE_NETS_V6[@]}"); priv_v6_elems="${priv_v6_elems%, }"
+        priv_v4_elems=$(printf "%s, " "${PRIVATE_NETS_V4[@]}")
+        priv_v4_elems="${priv_v4_elems%, }"
+        priv_v6_elems=$(printf "%s, " "${PRIVATE_NETS_V6[@]}")
+        priv_v6_elems="${priv_v6_elems%, }"
 
         if [[ "${nft_table_exists}" == true ]]; then
             echo "delete table inet ${NFT_TABLE_NAME}"
@@ -2169,9 +2244,9 @@ EOF
                 type filter hook forward priority filter; policy accept;
 EOF
         if [[ -n "${ft_devs}" ]]; then
-             echo '                # Offload established TCP/UDP flows (IPv4 and IPv6) to the flowtable.'
-             echo '                # meta l4proto matches both address families; ip protocol would silently skip IPv6.'
-             echo '                meta l4proto { tcp, udp } flow offload @f'
+            echo '                # Offload established TCP/UDP flows (IPv4 and IPv6) to the flowtable.'
+            echo '                # meta l4proto matches both address families; ip protocol would silently skip IPv6.'
+            echo '                meta l4proto { tcp, udp } flow offload @f'
         fi
         cat <<EOF
 
@@ -2233,7 +2308,7 @@ EOF
             }  
         }
 EOF
-    ) > "${nft_config_file}"
+    ) >"${nft_config_file}"
     # Note: -o (optimize) is intentionally omitted because it conflicts with 'auto-merge'
     # and causes "File exists" errors. 'auto-merge' combined with 'iprange' already
     # ensures the sets are optimized in the kernel.
@@ -2252,16 +2327,16 @@ EOF
     # Remove legacy iptables rules only after nftables is active.
     if command -v iptables &>/dev/null; then
         log "INFO" "Cleaning up legacy iptables rules..."
-        cleanup_iptables_chain iptables mangle  PREROUTING  LABO_PREROUTING
-        cleanup_iptables_chain iptables filter  INPUT       LABO_INPUT
-        cleanup_iptables_chain iptables filter  DOCKER-USER LABO_DOCKER_USER
-        cleanup_iptables_chain iptables nat     POSTROUTING LABO_POSTROUTING
+        cleanup_iptables_chain iptables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING
+        cleanup_iptables_chain iptables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT
+        cleanup_iptables_chain iptables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER
+        cleanup_iptables_chain iptables nat POSTROUTING "${IPTABLES_CHAIN_PREFIX}"_POSTROUTING
     fi
     if command -v ip6tables &>/dev/null; then
         log "INFO" "Cleaning up legacy ip6tables rules..."
-        cleanup_iptables_chain ip6tables mangle  PREROUTING  LABO_PREROUTING_V6
-        cleanup_iptables_chain ip6tables filter  INPUT       LABO_INPUT_V6
-        cleanup_iptables_chain ip6tables filter  DOCKER-USER LABO_DOCKER_USER_V6
+        cleanup_iptables_chain ip6tables mangle PREROUTING "${IPTABLES_CHAIN_PREFIX}"_PREROUTING_V6
+        cleanup_iptables_chain ip6tables filter INPUT "${IPTABLES_CHAIN_PREFIX}"_INPUT_V6
+        cleanup_iptables_chain ip6tables filter DOCKER-USER "${IPTABLES_CHAIN_PREFIX}"_DOCKER_USER_V6
     fi
     cleanup_legacy_ipset "${ALLOW_LIST_NAME_V4}" || true
     cleanup_legacy_ipset "${ALLOW_LIST_NAME_V6}" || true
@@ -2275,14 +2350,18 @@ EOF
 # Blocklist download status selects online or cached operation.
 # shellcheck disable=SC2310
 main() {
-    # 1. Check root, create secure temp dir, and setup traps
+    # Validate CLI and environment configuration before requiring root.
+    parse_arguments "$@"
+    if [[ "${CHECK_CONFIG}" == true ]]; then
+        printf 'ip_blocker configuration is valid\n'
+        return 0
+    fi
+
+    # Check root, create the secure staging directory and install traps.
     setup_temp_dir_and_traps
     log_dns_config
 
-    # 2. Parse -c, -p, -b, -G, -s flags
-    parse_arguments "$@"
-
-    # 3. Check internet (fail-fast)
+    # Check internet (fail-fast)
     check_connectivity
 
     # 4. Detect nftables vs iptables (must be *after* parse_arguments)
@@ -2299,8 +2378,8 @@ main() {
         "${MANUAL_ALLOW_LIST_DIR_V4}" "${MANUAL_ALLOW_LIST_DIR_V6}" \
         "${BLOCK_LIST_DIR}" "${BLOCK_LIST_DIR_V4}" "${BLOCK_LIST_DIR_V6}" \
         "${BLOCK_DOMAIN_DIR_V4}" "${BLOCK_DOMAIN_DIR_V6}" \
-        "${MANUAL_BLOCK_LIST_DIR_V4}" "${MANUAL_BLOCK_LIST_DIR_V6}" \
-        || die "Failed to create directories"
+        "${MANUAL_BLOCK_LIST_DIR_V4}" "${MANUAL_BLOCK_LIST_DIR_V6}" ||
+        die "Failed to create directories"
 
     # 7. Download v4 blocklists if -b is used.
     # Non-fatal: if the remote index is unreachable (transient DNS/network issue),

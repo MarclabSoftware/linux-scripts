@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-###############################################################################
 # Universal Geo-IP List Downloader
+# Version: 7.0.0
+# Updated: 2026-07-29
 #
 # Backend utility for 'ip_blocker.sh'. Downloads, parses, and validates
 # Geo-IP lists from multiple providers (ipdeny, ripe, nirsoft) using an
@@ -28,11 +29,6 @@
 # Environment:
 #   DNS_SERVERS    Custom DNS servers for early-boot resolution (e.g. "8.8.8.8 1.1.1.1")
 #
-# Author: LaboDJ
-# Version: 6.9
-# Last Updated: 2026/07/28
-###############################################################################
-
 # Enable strict mode
 # -E: Inherit traps (ERR, DEBUG, RETURN) in functions.
 # -e: Exit immediately if a command exits with a non-zero status.
@@ -48,16 +44,41 @@ set -Eeuo pipefail
 # Get the script's absolute directory
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 readonly SCRIPT_DIR
-readonly ALLOW_ROOT_DIR="${SCRIPT_DIR}/lists/allow/generated"
+
+load_environment() {
+    local env_file="${GEOIP_ENV_FILE:-${SCRIPT_DIR}/geo_ip_downloader.env}"
+    local env_mode
+
+    [[ -e "${env_file}" ]] || return 0
+    [[ -f "${env_file}" && -r "${env_file}" ]] || {
+        printf 'geo_ip_downloader: environment file is not readable: %s\n' "${env_file}" >&2
+        exit 1
+    }
+    env_mode="$(stat -c '%a' "${env_file}")"
+    (((8#${env_mode} & 8#022) == 0)) || {
+        printf 'geo_ip_downloader: environment file must not be group/world writable: %s\n' "${env_file}" >&2
+        exit 1
+    }
+
+    set -a
+    # The environment file is trusted administrator-controlled shell syntax.
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
+}
+
+load_environment
+
+readonly ALLOW_ROOT_DIR="${GEOIP_ALLOW_ROOT_DIR:-${IP_BLOCKER_LIST_DIR:-${SCRIPT_DIR}/lists}/allow/generated}"
 # Define the output directories for allowed lists
 readonly ALLOW_DIR_V4="${ALLOW_ROOT_DIR}/v4"
 readonly ALLOW_DIR_V6="${ALLOW_ROOT_DIR}/v6"
 # Required commands for dependency checks (base set; provider-specific added later)
 readonly REQUIRED_COMMANDS=(curl grep sed awk cut cp)
 # Max concurrent download jobs for parallel processing
-readonly MAX_DOWNLOAD_JOBS=4
+readonly MAX_DOWNLOAD_JOBS="${GEOIP_MAX_DOWNLOAD_JOBS:-4}"
 # Maximum download retry attempts (exponential backoff: 2s, 4s, 8s...)
-readonly MAX_DOWNLOAD_RETRIES=5
+readonly MAX_DOWNLOAD_RETRIES="${GEOIP_MAX_DOWNLOAD_RETRIES:-5}"
 # Allowed provider keys
 declare -ra ALLOWED_PROVIDERS=(ipdeny ripe nirsoft)
 
@@ -65,11 +86,12 @@ declare -ra ALLOWED_PROVIDERS=(ipdeny ripe nirsoft)
 # Global Variables
 ###################
 
-declare ALLOWED_COUNTRIES_SYNTAX="" # e.g., "ripe:IT,FR;ipdeny:CN"
-declare TEMP_DIR="" # Used for RIPE/Nirsoft downloads
+declare ALLOWED_COUNTRIES_SYNTAX="${GEOIP_COUNTRIES:-}" # e.g., "ripe:IT,FR;ipdeny:CN"
+declare TEMP_DIR=""                                     # Used for RIPE/Nirsoft downloads
 declare URL_PARSE_HOST=""
 declare URL_PARSE_PORT=""
 declare REQUIRE_IPV6_LISTS="${GEOIP_REQUIRE_IPV6:-true}"
+declare CHECK_CONFIG=false
 declare -a MISSING_EXPECTED_FILES=()
 # Cache for resolved hostnames to avoid redundant 'dig' calls
 declare -A RESOLVED_HOSTS_CACHE
@@ -91,7 +113,7 @@ handle_error() {
     local line_number=$1
     local i stack_trace=""
     for ((i = 1; i < ${#FUNCNAME[@]}; i++)); do
-        stack_trace+="${FUNCNAME[${i}]}(L${BASH_LINENO[$((i-1))]})"
+        stack_trace+="${FUNCNAME[${i}]}(L${BASH_LINENO[$((i - 1))]})"
         ((i < ${#FUNCNAME[@]} - 1)) && stack_trace+=" → "
     done
     log "ERROR" "Script failed at line ${line_number} with exit code ${exit_code} | stack: ${stack_trace}"
@@ -142,6 +164,8 @@ cleanup() {
 
 # Displays the help message and exits.
 print_usage() {
+    local exit_code="${1:-1}"
+
     cat <<EOF
 
 Usage: $0 -c PROVIDER:COUNTRIES_LIST[;PROVIDER2:LIST2...] [-h]
@@ -158,6 +182,7 @@ Options:
                   Single provider:   'ipdeny:US,CA'
                   Multiple providers: 'ripe:IT,FR;ipdeny:CN,KR;nirsoft:DE'
                   
+    -C          Validate configuration without downloading lists.
     -h          Display this help message.
 
 Providers:
@@ -165,21 +190,43 @@ Providers:
     ripe        - RIPE NCC Database (IPv4 & IPv6). High accuracy for Europe/Middle East.
     nirsoft     - CSV format (IPv4 only). Good alternative source.
 EOF
-    exit 1
+    exit "${exit_code}"
 }
 
 # Parses command-line options using getopts.
 parse_arguments() {
     OPTIND=1
-    while getopts ":c:h" opt; do
+    while getopts ":c:hC" opt; do
         case ${opt} in
-        c) ALLOWED_COUNTRIES_SYNTAX="${OPTARG}" ;;
-        h) print_usage ;;
-        \?) log "ERROR" "Invalid option: -${OPTARG}"; print_usage ;;
-        :) log "ERROR" "The option -${OPTARG} requires an argument"; print_usage ;;
-        *) log "ERROR" "Unexpected option parser state"; print_usage ;;
+            c) ALLOWED_COUNTRIES_SYNTAX="${OPTARG}" ;;
+            C) CHECK_CONFIG=true ;;
+            h) print_usage 0 ;;
+            \?)
+                log "ERROR" "Invalid option: -${OPTARG}"
+                print_usage
+                ;;
+            :)
+                log "ERROR" "The option -${OPTARG} requires an argument"
+                print_usage
+                ;;
+            *)
+                log "ERROR" "Unexpected option parser state"
+                print_usage
+                ;;
         esac
     done
+
+    [[ "${ALLOW_ROOT_DIR}" == /* ]] ||
+        die "GEOIP_ALLOW_ROOT_DIR must be an absolute path"
+    [[ "${MAX_DOWNLOAD_JOBS}" =~ ^[1-9][0-9]*$ ]] ||
+        die "GEOIP_MAX_DOWNLOAD_JOBS must be a positive integer"
+    [[ "${MAX_DOWNLOAD_RETRIES}" =~ ^[1-9][0-9]*$ ]] ||
+        die "GEOIP_MAX_DOWNLOAD_RETRIES must be a positive integer"
+    case "${REQUIRE_IPV6_LISTS}" in
+        1 | true) REQUIRE_IPV6_LISTS=true ;;
+        0 | false) REQUIRE_IPV6_LISTS=false ;;
+        *) die "GEOIP_REQUIRE_IPV6 must be 0, 1, true or false" ;;
+    esac
 
     # The -c (countries) option is non-negotiable.
     if [[ -z "${ALLOWED_COUNTRIES_SYNTAX}" ]]; then
@@ -196,8 +243,18 @@ normalize_and_validate_country_syntax() {
     [[ -n "${ALLOWED_COUNTRIES_SYNTAX}" ]] || die "Country/Provider syntax (-c) is mandatory."
 
     local syntax_regex='^[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*(;[A-Za-z]+:[A-Za-z]{2}(,[A-Za-z]{2})*)*$'
-    [[ "${ALLOWED_COUNTRIES_SYNTAX}" =~ ${syntax_regex} ]] \
-        || die "Invalid syntax. Use 'provider:CC,CC;provider2:CC' (example: 'ripe:IT,FR;ipdeny:CN')."
+    [[ "${ALLOWED_COUNTRIES_SYNTAX}" =~ ${syntax_regex} ]] ||
+        die "Invalid syntax. Use 'provider:CC,CC;provider2:CC' (example: 'ripe:IT,FR;ipdeny:CN')."
+
+    local group provider
+    local -a provider_groups
+    IFS=';' read -r -a provider_groups <<<"${ALLOWED_COUNTRIES_SYNTAX}"
+    for group in "${provider_groups[@]}"; do
+        provider="${group%%:*}"
+        provider="${provider,,}"
+        [[ " ${ALLOWED_PROVIDERS[*]} " == *" ${provider} "* ]] ||
+            die "Invalid provider '${provider}'. Allowed: ${ALLOWED_PROVIDERS[*]}"
+    done
 }
 
 ###################
@@ -212,7 +269,7 @@ check_dependencies() {
 
     # Append provider-specific commands if requested
     if [[ -n "${1:-}" ]]; then
-        read -ra extra <<< "$1"
+        read -ra extra <<<"$1"
         all_commands+=("${extra[@]}")
     fi
 
@@ -223,7 +280,7 @@ check_dependencies() {
     # Specifically check if awk has the log() function, which is
     # required for the RIPE provider's CIDR calculation.
     if ! awk 'BEGIN { exit !(log(8)/log(2) == 3) }' 2>/dev/null; then
-         missing_commands+=("awk (with 'log' function support)")
+        missing_commands+=("awk (with 'log' function support)")
     fi
 
     [[ ${#missing_commands[@]} -eq 0 ]] || die "Missing commands/features: ${missing_commands[*]}"
@@ -232,10 +289,10 @@ check_dependencies() {
 normalize_runtime_flags() {
     REQUIRE_IPV6_LISTS="${REQUIRE_IPV6_LISTS,,}"
     case "${REQUIRE_IPV6_LISTS}" in
-    true|false) ;;
-    *)
-        die "Invalid GEOIP_REQUIRE_IPV6 value '${REQUIRE_IPV6_LISTS}'. Allowed: true|false"
-        ;;
+        true | false) ;;
+        *)
+            die "Invalid GEOIP_REQUIRE_IPV6 value '${REQUIRE_IPV6_LISTS}'. Allowed: true|false"
+            ;;
     esac
 }
 
@@ -256,7 +313,10 @@ _resolve_hostname() {
     local host="$1"
     [[ -z "${DNS_SERVERS:-}" ]] && return 0
     # Return from cache if available
-    [[ -n "${RESOLVED_HOSTS_CACHE[${host}]:-}" ]] && { echo "${RESOLVED_HOSTS_CACHE[${host}]}"; return 0; }
+    [[ -n "${RESOLVED_HOSTS_CACHE[${host}]:-}" ]] && {
+        echo "${RESOLVED_HOSTS_CACHE[${host}]}"
+        return 0
+    }
 
     local -a ips=()
     local -a servers=()
@@ -265,7 +325,7 @@ _resolve_hostname() {
     local ip
     local rrtype
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        read -ra servers <<< "${DNS_SERVERS:-}"
+        read -ra servers <<<"${DNS_SERVERS:-}"
     fi
 
     # Try each DNS server until one succeeds
@@ -333,11 +393,14 @@ build_resolve_options_for_url() {
     local resolve_ip
     local resolved_ips
 
-    [[ -n "${DNS_SERVERS:-}" ]] || { printf -v "${result_var}" '%s' ""; return 0; }
+    [[ -n "${DNS_SERVERS:-}" ]] || {
+        printf -v "${result_var}" '%s' ""
+        return 0
+    }
 
     parse_url_endpoint "${url}"
     resolved_ips=$(_resolve_hostname "${URL_PARSE_HOST}")
-    read -ra ips <<< "${resolved_ips}"
+    read -ra ips <<<"${resolved_ips}"
     for ip in "${ips[@]}"; do
         resolve_ip="${ip}"
         [[ "${resolve_ip}" == *:* ]] && resolve_ip="[${resolve_ip}]"
@@ -360,7 +423,7 @@ file_has_markup_header() {
         if [[ "${line}" == *'<!doctype'* || "${line}" == *'<?xml'* || "${line}" == *'<!--'* || "${line}" == *'<html'* || "${line}" == *'<head'* || "${line}" == *'<body'* ]]; then
             return 0
         fi
-    done < "${file}"
+    done <"${file}"
 
     return 1
 }
@@ -380,7 +443,7 @@ download_file() {
     # 1. Handle custom DNS resolution if DNS_SERVERS is set (for early boot stability)
     if [[ -n "${DNS_SERVERS:-}" ]]; then
         build_resolve_options_for_url "${url}" resolve_opts_str
-        [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<< "${resolve_opts_str}"
+        [[ -n "${resolve_opts_str}" ]] && read -ra resolve_opts <<<"${resolve_opts_str}"
     fi
 
     while ((retries < MAX_DOWNLOAD_RETRIES)); do
@@ -544,8 +607,8 @@ validate_and_move_generated_file() {
     validation_rc=$?
 
     case ${validation_rc} in
-    2) log "ERROR" "DANGEROUS entry found in generated ${list_name} list. DISCARDING." ;;
-    *) log "WARN" "Generated ${list_name} list contains invalid, empty, or mixed content. Ignoring." ;;
+        2) log "ERROR" "DANGEROUS entry found in generated ${list_name} list. DISCARDING." ;;
+        *) log "WARN" "Generated ${list_name} list contains invalid, empty, or mixed content. Ignoring." ;;
     esac
     rm -f "${temp_file}"
 }
@@ -577,17 +640,17 @@ restore_missing_expected_lists() {
 
     local staging_dir allow_dir staging_file cached_file basename
     case "${family}" in
-    v4)
-        staging_dir="${STAGING_V4}"
-        allow_dir="${ALLOW_DIR_V4}"
-        ;;
-    v6)
-        staging_dir="${STAGING_V6}"
-        allow_dir="${ALLOW_DIR_V6}"
-        ;;
-    *)
-        die "Invalid list family for fallback restore: ${family}"
-        ;;
+        v4)
+            staging_dir="${STAGING_V4}"
+            allow_dir="${ALLOW_DIR_V4}"
+            ;;
+        v6)
+            staging_dir="${STAGING_V6}"
+            allow_dir="${ALLOW_DIR_V6}"
+            ;;
+        *)
+            die "Invalid list family for fallback restore: ${family}"
+            ;;
     esac
 
     for basename in "$@"; do
@@ -598,14 +661,14 @@ restore_missing_expected_lists() {
             if [[ "${REQUIRE_IPV6_LISTS}" == "true" ]]; then
                 MISSING_EXPECTED_FILES+=("${family}:${basename}")
             else
-                : > "${staging_file}"
+                : >"${staging_file}"
                 log "INFO" "Created empty IPv6 placeholder for Nirsoft list: ${basename}"
             fi
             continue
         fi
 
         if [[ "${family}" == "v6" && "${REQUIRE_IPV6_LISTS}" != "true" ]]; then
-            : > "${staging_file}"
+            : >"${staging_file}"
             log "WARN" "IPv6 list unavailable but optional for this run. Using empty placeholder: ${basename}"
             continue
         fi
@@ -647,7 +710,6 @@ atomic_swap_directory() {
     die "Atomic directory swap failed for '${target_dir}'"
 }
 
-
 # A wrapper function that downloads, cleans, and validates a simple list.
 # @param $1 The URL to download
 # @param $2 The final output file path
@@ -675,7 +737,7 @@ download_and_validate_simple() {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
             if ($0 != "") print
         }
-    ' "${temp_outfile}" > "${temp_outfile}.cleaned" || die "Failed to normalize ${proto_name} list"
+    ' "${temp_outfile}" >"${temp_outfile}.cleaned" || die "Failed to normalize ${proto_name} list"
     mv -f -- "${temp_outfile}.cleaned" "${temp_outfile}" || die "Failed to finalize normalized ${proto_name} list"
 
     validate_and_move_generated_file "${temp_outfile}" "${outfile}" "${proto_name}"
@@ -782,7 +844,7 @@ download_provider_ripe() {
             log "WARN" "Failed to compute RIPE checksum. Falling back to cached per-country lists where available."
             return
         fi
-        read -r computed_md5 _ <<< "${md5_output}"
+        read -r computed_md5 _ <<<"${md5_output}"
         if [[ "${expected_md5}" != "${computed_md5}" ]]; then
             rm -f "${ripe_data_file}" "${ripe_md5_file}"
             log "WARN" "RIPE MD5 checksum mismatch. Falling back to cached per-country lists where available."
@@ -811,8 +873,8 @@ download_provider_ripe() {
         local temp_v6="${v6_out}.tmp"
 
         # Ensure temp files are empty/exist
-        : > "${temp_v4}"
-        : > "${temp_v6}"
+        : >"${temp_v4}"
+        : >"${temp_v6}"
 
         temp_v4_files[${code}]="${temp_v4}"
         temp_v6_files[${code}]="${temp_v6}"
@@ -878,7 +940,7 @@ download_provider_ripe() {
         local code_lower="${code,,}"
         local v4_out="${STAGING_V4}/${code_lower}.ripe.list.v4"
         local v6_out="${STAGING_V6}/${code_lower}.ripe.list.v6"
-        
+
         # Retrieve temp files from our array
         local temp_v4="${temp_v4_files[${code}]}"
         local temp_v6="${temp_v6_files[${code}]}"
@@ -917,7 +979,7 @@ _download_country_nirsoft() {
 
     # Parse the CSV. Format: Start IP, End IP, ..., ...
     # We convert "Start IP, End IP" to "StartIP - EndIP" for iprange
-    awk -F',' 'NF>4 {printf "%s - %s\n", $1, $2}' "${temp_csv_file}" > "${TEMP_V4_OUT_FILE}"
+    awk -F',' 'NF>4 {printf "%s - %s\n", $1, $2}' "${temp_csv_file}" >"${TEMP_V4_OUT_FILE}"
     rm -f "${temp_csv_file}" # Clean up downloaded CSV
 
     validate_and_move_generated_file "${TEMP_V4_OUT_FILE}" "${V4_OUT_FILE}" "${list_name}"
@@ -957,6 +1019,10 @@ main() {
     parse_arguments "$@"
     normalize_and_validate_country_syntax
     normalize_runtime_flags
+    if [[ "${CHECK_CONFIG}" == true ]]; then
+        printf 'geo_ip_downloader configuration is valid\n'
+        return 0
+    fi
     log_dns_config
 
     # 2. Check for all required tools
@@ -992,21 +1058,24 @@ main() {
 
     # Split on semicolons using parameter expansion (no subshell)
     local -a provider_groups
-    IFS=';' read -ra provider_groups <<< "${ALLOWED_COUNTRIES_SYNTAX}"
+    IFS=';' read -ra provider_groups <<<"${ALLOWED_COUNTRIES_SYNTAX}"
 
     for group in "${provider_groups[@]}"; do
         [[ -n "${group}" ]] || continue # Skip empty entries
 
         # Split "provider:C1,C2" using parameter expansion
         local provider_name="${group%%:*}"
-        provider_name="${provider_name,,}"          # lowercase
-        provider_name="${provider_name// /}"         # strip spaces
-        local country_list_csv="${group#*:}"         # everything after first colon
+        provider_name="${provider_name,,}"   # lowercase
+        provider_name="${provider_name// /}" # strip spaces
+        local country_list_csv="${group#*:}" # everything after first colon
 
         # Validate provider against array
         local valid=false
         for p in "${ALLOWED_PROVIDERS[@]}"; do
-            [[ "${p}" == "${provider_name}" ]] && { valid=true; break; }
+            [[ "${p}" == "${provider_name}" ]] && {
+                valid=true
+                break
+            }
         done
         if ! "${valid}"; then
             die "Invalid provider '${provider_name}' in syntax. Allowed: ${ALLOWED_PROVIDERS[*]}"
@@ -1033,7 +1102,7 @@ main() {
         local -A seen_countries=()
         # Deduplicate in Bash to avoid spawning sort for a tiny fixed alphabet.
         local -a raw_countries=()
-        read -ra raw_countries <<< "${provider_country_map[${provider}]}"
+        read -ra raw_countries <<<"${provider_country_map[${provider}]}"
         for code in "${raw_countries[@]}"; do
             [[ -n "${seen_countries[${code}]:-}" ]] && continue
             seen_countries[${code}]=1
@@ -1052,23 +1121,23 @@ main() {
         done
 
         case "${provider}" in
-        "ipdeny")
-            # Pass the country array to the function
-            download_provider_ipdeny "${country_array[@]}"
-            ;;
-        "ripe")
-            # RIPE is monolithic; it must run sequentially in the main thread.
-            # Pass the country array to the function.
-            download_provider_ripe "${country_array[@]}"
-            ;;
-        "nirsoft")
-            # Pass the country array to the function
-            download_provider_nirsoft "${country_array[@]}"
-            ;;
-        *)
-            # This should be unreachable due to validation above
-            die "Unknown or unsupported provider: '${provider}'"
-            ;;
+            "ipdeny")
+                # Pass the country array to the function
+                download_provider_ipdeny "${country_array[@]}"
+                ;;
+            "ripe")
+                # RIPE is monolithic; it must run sequentially in the main thread.
+                # Pass the country array to the function.
+                download_provider_ripe "${country_array[@]}"
+                ;;
+            "nirsoft")
+                # Pass the country array to the function
+                download_provider_nirsoft "${country_array[@]}"
+                ;;
+            *)
+                # This should be unreachable due to validation above
+                die "Unknown or unsupported provider: '${provider}'"
+                ;;
         esac
     done
 

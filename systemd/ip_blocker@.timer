@@ -1,0 +1,12 @@
+[Unit]
+Description=Update GeoIP firewall rules periodically
+# Instance: Linux account used by the matching service template.
+# Example: ip_blocker@service-user.timer
+
+[Timer]
+OnActiveSec=20s
+OnUnitActiveSec=4h
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
