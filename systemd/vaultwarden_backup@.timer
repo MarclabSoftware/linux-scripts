@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up Vaultwarden every hour
+# Instance: Linux account used by the matching service template.
+# Example: vaultwarden_backup@service-user.timer
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

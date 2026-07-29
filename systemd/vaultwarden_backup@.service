@@ -1,0 +1,36 @@
+[Unit]
+Description=Send a consistent Vaultwarden backup to a remote receiver
+# Instance: Linux account that owns /home/<instance>/scripts.
+# Example: vaultwarden_backup@service-user.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The instance name is the account that owns the data and SSH key.
+User=%i
+Group=%i
+UMask=0077
+EnvironmentFile=/home/%i/scripts/vaultwarden_backup_send.env
+ExecStart=/home/%i/scripts/vaultwarden_backup_send.sh
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=full
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
