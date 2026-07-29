@@ -1,0 +1,9 @@
+# mosquitto_pub configuration for the local AC power-state publisher.
+# Copy to power_state.conf beside the script, replace the placeholders, and set
+# mode 0600. The file is ignored by Git because it contains credentials.
+--unix /absolute/path/to/mosquitto.sock
+-u mqtt_username
+-P replace_with_mqtt_password
+-t home/power/state
+-q 0
+-r

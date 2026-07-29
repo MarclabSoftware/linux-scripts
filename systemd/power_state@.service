@@ -1,0 +1,45 @@
+[Unit]
+Description=Publish the AC power state to MQTT
+# Instance: Linux account that owns /home/<instance>/scripts.
+# Example: power_state@service-user.service
+Documentation=man:mosquitto_pub(1)
+Wants=docker.service
+After=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+ExecStart=/home/%i/scripts/power_state.sh
+TimeoutStartSec=3s
+Restart=on-failure
+RestartSec=1s
+RestartSteps=6
+RestartMaxDelaySec=1min
+
+# The publisher only needs read access to sysfs, its configuration and the
+# Mosquitto Unix socket.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# Keep the udev worker short-lived: ask systemd to restart the oneshot service
+# whenever a mains power supply reports a state change. Replace service-user
+# with the account used to instantiate power_state@.service before installing.
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", RUN+="/usr/bin/systemctl --no-block restart power_state@service-user.service"

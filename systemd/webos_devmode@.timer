@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew LG webOS Developer Mode
+# Instance: Linux account used by the matching service template.
+# Example: webos_devmode@service-user.timer
+
+[Timer]
+OnCalendar=*-*-* 20:30:00
+OnCalendar=*-*-* 21:30:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
