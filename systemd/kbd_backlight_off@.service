@@ -1,0 +1,36 @@
+[Unit]
+Description=Turn off keyboard backlight %I
+# Instance: sysfs LED directory name under /sys/class/leds.
+# Example: kbd_backlight_off@platform::kbd_backlight.service
+Documentation=man:systemd.exec(5)
+ConditionPathExists=/sys/class/leds/%I/brightness
+
+[Service]
+Type=oneshot
+StandardInput=data
+StandardInputText=0
+StandardOutput=null
+ExecStart=/usr/bin/tee /sys/class/leds/%I/brightness
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/class/leds/%I/brightness
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

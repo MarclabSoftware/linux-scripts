@@ -1,0 +1,33 @@
+[Unit]
+Description=Set console blanking and powerdown for %I
+# Instance: console device name under /dev (normally "tty1").
+# Example: console_powersave@tty1.service
+Documentation=man:setterm(1)
+After=getty@%i.service
+ConditionPathExists=/dev/%I
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/setterm --term linux --blank 1 --powerdown 2 --file /dev/%I
+
+CapabilityBoundingSet=CAP_SYS_TTY_CONFIG
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
