@@ -1,292 +1,179 @@
 #!/usr/bin/env bash
 
-###############################################################################
-# Raspberry Pi System Maintenance Script
+# Debian System Maintenance
+# Version: 2.0.0
+# Updated: 2026-07-29
 #
-# This comprehensive maintenance script performs system updates, backups, and
-# cleanup operations for a Raspberry Pi running Docker containers. It includes
-# safety checks, logging, and thorough cleanup procedures.
-#
-# Features:
-# - System configuration backup
-# - Full system update (apt packages)
-# - Raspberry Pi EEPROM updates
-# - Docker container updates and maintenance
-# - System and Docker cleanup operations
-# - Disk usage monitoring
-# - Comprehensive logging
-#
-# Components Managed:
-# - System packages and configurations
-# - Docker containers (Node-RED and others)
-# - System logs and temporary files
-# - EEPROM firmware
-# - Configuration files backup
-#
-# Backup Locations:
-# - Primary backup directory: /home/${SUDO_USER}/backups
-# - Docker base directory: /home/${SUDO_USER}/docker
-#
-# Requirements:
-# - Root privileges (run with sudo)
-# - Docker
-# - apt package manager
-# - rpi-eeprom-update utility
-# - tar utility
-#
-# Usage:
-#   sudo ./script.sh
-#
-#
-# Author: LaboDJ
-# Version: 1.1
-# Last Updated: 2025/01/16
-###############################################################################
+# Updates Debian packages and optionally creates a configuration archive,
+# vacuums the journal, updates Raspberry Pi EEPROM firmware and prunes unused
+# Docker data. Destructive Docker pruning is disabled by default.
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
+umask 077
 
-#==============================================================================
-# Configuration
-#==============================================================================
-# Get the real user who executed sudo
-readonly REAL_USER="${SUDO_USER:-$USER}"
-readonly BACKUP_DIR="/home/${REAL_USER}/backups"
-BACKUP_FILE="${BACKUP_DIR}/config-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
-readonly BACKUP_FILE
-readonly DOCKER_CONTAINERS=("node-red")
-readonly DOCKER_BASE_DIR="/home/${REAL_USER}/docker"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly DEFAULT_ENV_FILE="${SCRIPT_DIR}/update_debian.env"
 
-#==============================================================================
-# Utility Functions
-#==============================================================================
-log_info() {
-    echo -e "\n[INFO] $1"
+die() {
+    printf 'update_debian: %s\n' "$*" >&2
+    exit 1
 }
 
-log_error() {
-    echo -e "\n[ERROR] $1" >&2
+log() {
+    printf '[%(%Y-%m-%d %H:%M:%S)T] [%s] %s\n' -1 "$1" "$2" >&2
 }
 
-log_warning() {
-    echo -e "\n[WARNING] $1" >&2
+load_environment() {
+    local env_file="${SYSTEM_UPDATE_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+    local env_mode
+
+    [[ -e "${env_file}" ]] || return 0
+    [[ -f "${env_file}" && -r "${env_file}" ]] || die "environment file is not readable: ${env_file}"
+    env_mode="$(stat -c '%a' "${env_file}")"
+    (((8#${env_mode} & 8#022) == 0)) || die "environment file must not be group/world writable: ${env_file}"
+
+    set -a
+    # The environment file is trusted administrator-controlled shell syntax.
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
 }
 
-show_disk_usage() {
-    log_info "Disk usage:"
-    df -h /
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-check_root() {
-    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        log_error "This script must be run as root"
-        exit 1
-    fi
+validate_boolean() {
+    local name="$1"
+    local value="$2"
+    [[ "${value}" == "0" || "${value}" == "1" ]] || die "${name} must be 0 or 1"
 }
 
-check_dependencies() {
-    local -r deps=("apt" "docker" "tar" "rpi-eeprom-update")
-    for dep in "${deps[@]}"; do
-        if ! command -v "${dep}" >/dev/null 2>&1; then
-            log_error "Required dependency '${dep}' is not installed"
-            exit 1
-        fi
-    done
-}
-
-#==============================================================================
-# Backup Functions
-#==============================================================================
 create_backup() {
-    log_info "Creating system backup..."
-    mkdir -p "${BACKUP_DIR}"
+    local timestamp
+    local backup_file
 
-    tar -czf "${BACKUP_FILE}" \
-        /boot/firmware/config.txt \
-        /boot/firmware/cmdline.txt \
-        /etc/ssh/sshd_config \
-        /etc/ssh/sshd_config.d/* \
-        "/home/${REAL_USER}/.ssh" \
-        /root/.ssh \
-        /etc/systemd/journald.conf.d/"${REAL_USER}"* \
-        /etc/systemd/resolved.conf.d/"${REAL_USER}"* \
-        /etc/systemd/timesyncd.conf.d/"${REAL_USER}"* \
-        /etc/systemd/network/end0* \
-        /etc/systemd/network/eth0* \
-        /etc/systemd/system/"${REAL_USER}"* \
-        /etc/default/rpi-eeprom-update \
-        /etc/sysctl.d/99-maxperfwiz.conf \
-        /etc/sysctl.d/"${REAL_USER}"-network.conf \
-        /etc/udev/rules.d/"${REAL_USER}"* \
-        /etc/udev/rules.d/66-maxperfwiz.rules \
-        /home/"${REAL_USER}"/.nanorc \
-        /root/.nanorc ||
-        log_warning "Some files could not be backed up"
+    [[ "${BACKUP_ENABLED}" == "1" ]] || return 0
+    [[ -r "${BACKUP_PATHS_FILE}" ]] || die "backup paths file is not readable: ${BACKUP_PATHS_FILE}"
+    mkdir -p -- "${BACKUP_DIR}"
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_file="${BACKUP_DIR}/debian-config-${timestamp}.tar.gz"
 
-    chmod 600 "${BACKUP_FILE}"
-    log_info "Backup created at ${BACKUP_FILE}"
+    log INFO "Creating configuration backup: ${backup_file}"
+    tar \
+        --create \
+        --gzip \
+        --file "${backup_file}" \
+        --ignore-failed-read \
+        --warning=no-file-changed \
+        --files-from "${BACKUP_PATHS_FILE}"
+    chmod 0600 -- "${backup_file}"
 }
 
-#==============================================================================
-# System Update Functions
-#==============================================================================
-update_system() {
-    log_info "Updating package lists..."
-    apt update || {
-        log_error "Failed to update package lists"
-        exit 1
-    }
+update_packages() {
+    local apt_args=()
 
-    log_info "Performing full system upgrade..."
-    apt full-upgrade -y || {
-        log_error "System upgrade failed"
-        exit 1
-    }
-
-    log_info "Cleaning up packages..."
-    apt autoclean
-    apt clean
-    apt autoremove -y
+    [[ "${ASSUME_YES}" == "0" ]] || apt_args+=(--yes)
+    log INFO "Refreshing package metadata"
+    apt-get update
+    log INFO "Upgrading installed packages"
+    DEBIAN_FRONTEND=noninteractive apt-get "${apt_args[@]}" dist-upgrade
+    log INFO "Removing orphaned packages and package cache"
+    DEBIAN_FRONTEND=noninteractive apt-get "${apt_args[@]}" autoremove
+    apt-get clean
 }
 
-update_raspberry_eeprom() {
-    log_info "Updating Raspberry Pi EEPROM..."
-    if rpi-eeprom-update -a; then
-        log_info "EEPROM update completed successfully"
-    else
-        log_warning "EEPROM update failed or not needed"
+update_raspberry_pi_eeprom() {
+    [[ "${UPDATE_RPI_EEPROM}" == "1" ]] || return 0
+    if ! command -v rpi-eeprom-update >/dev/null 2>&1; then
+        log WARN "rpi-eeprom-update is unavailable; skipping EEPROM update"
+        return 0
+    fi
+    log INFO "Applying available Raspberry Pi EEPROM updates"
+    rpi-eeprom-update -a
+}
+
+vacuum_journal() {
+    [[ -n "${JOURNAL_RETENTION}" ]] || return 0
+    log INFO "Vacuuming journal entries older than ${JOURNAL_RETENTION}"
+    journalctl --vacuum-time="${JOURNAL_RETENTION}"
+}
+
+prune_docker() {
+    [[ "${DOCKER_PRUNE}" == "1" ]] || return 0
+    require_command docker
+
+    log WARN "Pruning unused Docker containers, networks, images and build cache"
+    docker system prune --all --force
+    if [[ "${DOCKER_PRUNE_VOLUMES}" == "1" ]]; then
+        log WARN "Pruning unused Docker volumes"
+        docker volume prune --force
     fi
 }
 
-#==============================================================================
-# Docker Management Functions
-#==============================================================================
-update_docker_containers() {
-    log_info "Updating Docker containers..."
+load_environment
 
-    for container in "${DOCKER_CONTAINERS[@]}"; do
-        if docker ps | grep -q "${container}"; then
-            log_info "Updating ${container}..."
-            case "${container}" in
-            "node-red")
-                docker exec "${container}" bash -c 'cd /data && npm update && npm cache clean --force' ||
-                    log_warning "Failed to update ${container} packages"
-                docker container restart "${container}" ||
-                    log_warning "Failed to restart ${container}"
-                ;;
-            esac
-        else
-            log_warning "Container ${container} not found or not running"
-        fi
-    done
-}
+readonly BACKUP_ENABLED="${SYSTEM_UPDATE_BACKUP_ENABLED:-0}"
+readonly BACKUP_DIR="${SYSTEM_UPDATE_BACKUP_DIR:-/var/backups/system-maintenance}"
+readonly BACKUP_PATHS_FILE="${SYSTEM_UPDATE_BACKUP_PATHS_FILE:-${SCRIPT_DIR}/update_debian.paths}"
+readonly ASSUME_YES="${SYSTEM_UPDATE_ASSUME_YES:-1}"
+readonly UPDATE_RPI_EEPROM="${SYSTEM_UPDATE_RPI_EEPROM:-0}"
+readonly JOURNAL_RETENTION="${SYSTEM_UPDATE_JOURNAL_RETENTION:-}"
+readonly DOCKER_PRUNE="${SYSTEM_UPDATE_DOCKER_PRUNE:-0}"
+readonly DOCKER_PRUNE_VOLUMES="${SYSTEM_UPDATE_DOCKER_PRUNE_VOLUMES:-0}"
+readonly LOCK_FILE="${SYSTEM_UPDATE_LOCK_FILE:-/run/lock/update_debian.lock}"
 
-cleanup_docker() {
-    log_info "Cleaning Docker system..."
+for boolean_name in BACKUP_ENABLED ASSUME_YES UPDATE_RPI_EEPROM DOCKER_PRUNE DOCKER_PRUNE_VOLUMES; do
+    validate_boolean "${boolean_name}" "${!boolean_name}"
+done
+[[ "${BACKUP_DIR}" == /* && "${BACKUP_PATHS_FILE}" == /* && "${LOCK_FILE}" == /* ]] ||
+    die "backup directory, paths file and lock file must be absolute paths"
+[[ "${DOCKER_PRUNE}" == "1" || "${DOCKER_PRUNE_VOLUMES}" == "0" ]] ||
+    die "volume pruning requires SYSTEM_UPDATE_DOCKER_PRUNE=1"
 
-    # Remove unused Docker images
-    log_info "Removing unused Docker images..."
-    docker image prune -af
+check_config=false
+skip_backup=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check-config) check_config=true ;;
+        --skip-backup) skip_backup=true ;;
+        --help | -h)
+            printf 'Usage: update_debian.sh [--check-config] [--skip-backup]\n'
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
 
-    # Remove stopped containers
-    log_info "Removing stopped containers..."
-    docker container prune -f
+if [[ "${check_config}" == "true" ]]; then
+    [[ "${BACKUP_ENABLED}" == "0" || -r "${BACKUP_PATHS_FILE}" ]] ||
+        die "backup paths file is not readable: ${BACKUP_PATHS_FILE}"
+    printf 'update_debian configuration is valid\n'
+    exit 0
+fi
 
-    # Remove unused volumes
-    log_info "Removing unused volumes..."
-    docker volume prune -f
+((EUID == 0)) || die "run this script as root"
+require_command apt-get
+require_command flock
+require_command tar
 
-    # Remove build cache
-    log_info "Removing build cache..."
-    docker builder prune -f
+exec 9>"${LOCK_FILE}"
+flock -n 9 || die "another Debian maintenance process is already running"
 
-    # Docker system prune
-    log_info "Docker system prune..."
-    docker system prune -a -f
-
-    # Clean specific Docker directories
-    clean_docker_directories
-}
-
-clean_docker_directories() {
-    log_info "Cleaning Docker directories..."
-
-    local dirs=(
-        "esphome:./build ./platformio"
-        "home-assistant:./home-assistant.log ./home-assistant.log.1 ./home-assistant.log.fault"
-        "mosquitto:./log/mosquitto.log"
-        "npm:./data/logs/*"
-        "omada:./logs/*"
-        "technitium:./logs/*"
-        "vaultwarden:./data/vaultwarden.log"
-        "z2m:./log/*"
-    )
-
-    for dir_entry in "${dirs[@]}"; do
-        IFS=':' read -r dir files <<<"${dir_entry}"
-        if cd "${DOCKER_BASE_DIR}/${dir}" 2>/dev/null; then
-            log_info "Cleaning ${DOCKER_BASE_DIR}/${dir}"
-            # shellcheck disable=SC2086
-            rm -vrf ${files}
-        else
-            log_warning "${DOCKER_BASE_DIR}/${dir} not found, skipping"
-        fi
-    done
-}
-
-#==============================================================================
-# System Cleanup Functions
-#==============================================================================
-cleanup_system() {
-    log_info "Cleaning system logs..."
-    find /var/log -type f -name "*.gz" -delete
-    find /var/log -type f -name "*.1" -delete
-    find /var/log -type f -name "*.old" -delete
-    truncate -s 0 /var/log/*.log 2>/dev/null || true
-    journalctl --vacuum-time=1d
-
-    log_info "Cleaning temporary files..."
-    find /tmp -type f -mtime +10 -delete 2>/dev/null || true
-    find /var/tmp -type f -mtime +10 -delete 2>/dev/null || true
-
-    # Clean system cache
-    log_info "Cleaning system cache..."
-    sync
-    echo 3 >/proc/sys/vm/drop_caches
-}
-
-#==============================================================================
-# Main Execution
-#==============================================================================
-main() {
-    log_info "Starting system update process..."
-
-    # Pre-flight checks
-    check_root
-    check_dependencies
-
-    # Show initial disk usage
-    show_disk_usage
-
-    # Create system backup
+df -h /
+if [[ "${skip_backup}" == "false" ]]; then
     create_backup
+fi
+update_packages
+update_raspberry_pi_eeprom
+vacuum_journal
+prune_docker
+df -h /
 
-    # Update sequence
-    update_system
-    update_raspberry_eeprom
-    update_docker_containers
-
-    # Cleanup sequence
-    cleanup_docker
-    cleanup_system
-
-    # Show final disk usage
-    show_disk_usage
-
-    log_info "System update completed successfully!"
-    log_info "Backup file: ${BACKUP_FILE}"
-    log_info "A system reboot is recommended to apply all updates."
-}
-
-# Execute main function
-main "$@"
+if [[ -e /run/reboot-required ]]; then
+    log WARN "A reboot is required"
+fi
+log INFO "Debian system maintenance completed"

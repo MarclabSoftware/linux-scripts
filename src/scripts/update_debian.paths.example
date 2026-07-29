@@ -1,0 +1,5 @@
+# One absolute path per line. tar reads this file literally; shell globs are not expanded.
+/etc/ssh
+/etc/systemd
+/etc/sysctl.d
+/etc/udev/rules.d
