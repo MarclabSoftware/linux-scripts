@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch the CA bundle used by Unbound TLS
+# Instance: Unbound service and configuration name (normally "unbound").
+# Example: unbound_ca_bundle_reload@unbound.path
+Documentation=man:systemd.path(5)
+
+[Path]
+# Arch Linux exposes the same bundle through both paths. Watching both keeps
+# the unit correct whether the symlink or its target is replaced.
+PathChanged=/etc/ssl/cert.pem
+PathChanged=/etc/ca-certificates/extracted/tls-ca-bundle.pem
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Dump the Unbound DNS cache every 10 minutes
+# Instance: Unbound service and configuration name (normally "unbound").
+# Example: unbound_cache_dump@unbound.timer
+After=%i.service
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

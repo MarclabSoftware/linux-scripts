@@ -1,0 +1,39 @@
+[Unit]
+Description=Reload Unbound TLS contexts after CA bundle changes
+# Instance: Unbound service and configuration name (normally "unbound").
+# Example: unbound_ca_bundle_reload@unbound.service
+Documentation=man:unbound-checkconf(8) man:unbound-control(8)
+After=%i.service
+BindsTo=%i.service
+ConditionPathExists=/run/%i/%i.ctl
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+WorkingDirectory=/etc/%i
+ExecStart=/usr/bin/unbound-checkconf /etc/%i/unbound.conf
+ExecStart=/usr/bin/unbound-control -s /run/%i/%i.ctl fast_reload
+TimeoutStartSec=30s
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

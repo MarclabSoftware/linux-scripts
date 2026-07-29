@@ -1,0 +1,12 @@
+[Unit]
+Description=Update the Unbound root hints monthly
+# Instance: Unbound service and configuration name (normally "unbound").
+# Example: unbound_roothints@unbound.timer
+After=%i.service
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
