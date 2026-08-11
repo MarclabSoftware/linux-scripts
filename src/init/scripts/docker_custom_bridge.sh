@@ -1,36 +1,50 @@
 #!/usr/bin/env bash
 
-createCustomDockerBridgeNetwork() {
-    echo -e "\n\nCreating Docker custom bridge network"
+# Provisioning module: custom Docker bridge network.
+#
+# Creates one local bridge with Docker-managed IPAM. An existing network is
+# reused only when its driver is already bridge; mismatches require deliberate
+# administrator intervention and are never deleted automatically.
+#
+# Configuration and helpers are injected by init.sh.
+# shellcheck disable=SC2154
 
-    local docker_group="docker"
-
-    if ! checkCommand "docker"; then
-        echo >&2 "docker command missing, cannot proceed"
+validateCustomDockerBridgeConfiguration() {
+    [[ -v CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME ]] || {
+        printf 'Missing CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME configuration\n' >&2
         return 1
-    fi
-
-    checkConfig "CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME" || return 1
-
-    if ! checkSU 2>/dev/null && ! isMeInGroup "$docker_group"; then
-        echo >&2 -e "\nCurrent user isn't in $docker_group group, cannot proceed"
-        echo >&2 -e "\nAdd current user to $docker_group group or run this script as root"
-        return 1
-    fi
-
-    docker network create "$CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME"
-    echo "Docker custom bridge network '$CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME' created"
-    return 0
+    }
+    validateDockerNetworkName \
+        "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}"
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+createCustomDockerBridgeNetwork() {
+    local driver
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/utils.sh"
-    . "$SCRIPT_D/init.conf"
-    createCustomDockerBridgeNetwork
-    exit $?
-fi
+    validateCustomDockerBridgeConfiguration || return
+    checkCommand docker || return
+    docker info --format '{{.ServerVersion}}' >/dev/null || {
+        printf 'Docker daemon is not available\n' >&2
+        return 1
+    }
+
+    printf '\nConfiguring Docker bridge network %s\n' \
+        "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}"
+    if driver="$(docker network inspect --format '{{.Driver}}' -- \
+        "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}" 2>/dev/null)"; then
+        [[ "${driver}" == bridge ]] || {
+            printf 'Docker network %s uses driver %s, expected bridge\n' \
+                "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}" \
+                "${driver}" >&2
+            return 1
+        }
+        printf 'Docker bridge network %s already matches\n' \
+            "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}"
+        return 0
+    fi
+
+    docker network create --driver bridge -- \
+        "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}" >/dev/null
+    printf 'Docker bridge network %s created\n' \
+        "${CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME}"
+}

@@ -1,43 +1,53 @@
 #!/usr/bin/env bash
 
-startDockerCompose() {
+# Provisioning module: Docker Compose startup.
+#
+# Validates one Compose file and starts its project in detached mode during
+# phase two. Compose resolves relative paths from the first specified file, so
+# no working-directory mutation or project-directory override is required.
+#
+# Configuration and helpers are injected by init.sh.
+# shellcheck disable=SC2154
 
-    echo -e "\n\nStarting docker compose"
+validateDockerComposeConfiguration() {
+    local compose_file="${CONFIG_DOCKER_COMPOSE_FILE_PATH:-}"
 
-    if ! checkCommand "docker"; then
-        echo >&2 "docker command missing, cannot proceed"
+    [[ "${compose_file}" == /* &&
+        "${compose_file}" != *[$'\r\n']* ]] || {
+        printf 'CONFIG_DOCKER_COMPOSE_FILE_PATH must be a single-line absolute path\n' >&2
         return 1
-    fi
-
-    local docker_group="docker"
-    if ! checkSU 2>/dev/null && ! isMeInGroup "$docker_group"; then
-        echo >&2 -e "\nCurrent user isn't in $docker_group group, cannot proceed"
-        echo >&2 -e "\nAdd current user to $docker_group group or run this script as root"
-        return 1
-    fi
-
-    checkConfig "CONFIG_DOCKER_COMPOSE_FILE_PATH" || return 1
-
-    if [ ! -f "$CONFIG_DOCKER_COMPOSE_FILE_PATH" ]; then
-        echo "Cannot find $CONFIG_DOCKER_COMPOSE_FILE_PATH compose file, please check"
-        paktc
-        return 1
-    fi
-
-    docker compose -f "$CONFIG_DOCKER_COMPOSE_FILE_PATH" up -d
-    echo -e "\nServices in $CONFIG_DOCKER_COMPOSE_FILE_PATH compose file should be up and running"
-
-    return 0
+    }
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+startDockerCompose() {
+    local compose_file
+    local -a compose_command
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/utils.sh"
-    . "$SCRIPT_D/init.conf"
-    startDockerCompose
-    exit $?
-fi
+    validateDockerComposeConfiguration || return
+    checkCommand docker || return
+    compose_file="${CONFIG_DOCKER_COMPOSE_FILE_PATH}"
+    [[ -f "${compose_file}" && -r "${compose_file}" ]] || {
+        printf 'Compose file is not a readable regular file: %s\n' \
+            "${compose_file}" >&2
+        return 1
+    }
+
+    docker compose version >/dev/null || {
+        printf 'Docker Compose plugin is not available\n' >&2
+        return 1
+    }
+    compose_command=(docker compose --file "${compose_file}")
+    "${compose_command[@]}" config --quiet || {
+        printf 'Docker Compose configuration is invalid: %s\n' \
+            "${compose_file}" >&2
+        return 1
+    }
+    docker info --format '{{.ServerVersion}}' >/dev/null || {
+        printf 'Docker daemon is not available\n' >&2
+        return 1
+    }
+
+    printf '\nStarting Docker Compose project from %s\n' "${compose_file}"
+    "${compose_command[@]}" up --detach
+    printf 'Docker Compose project started\n'
+}

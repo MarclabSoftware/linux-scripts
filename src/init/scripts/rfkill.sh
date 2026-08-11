@@ -1,38 +1,57 @@
 #!/usr/bin/env bash
 
-blockRf() {
-    if ! checkCommand "rfkill"; then
-        echo >&2 "Cannot continue"
-        return 1 # Error
-    fi
+# Provisioning module: RFKill.
+#
+# Soft-blocks configured radio types or numeric RFKill device IDs. On systemd
+# hosts, systemd-rfkill normally saves the resulting state and restores it at
+# boot. Configuration and shared helpers are injected by init.sh.
 
-    declare -a config_interfaces_arr
+parseRfkillTargets() {
+    local target_list="$1"
+    local output_name="$2"
+    local -n output_ref="${output_name}"
+    local -a raw_targets=()
+    local target
 
-    if isVarEmpty "$CONFIG_RFKILL_INTERFACES"; then
-        echo "CONFIG_RFKILL_INTERFACES unset or empty"
-        echo -e "\nWireless interfaces found:\n"
-        rfkill list
-        echo -e "\nPlease input one or more space separated interfaces to block, then press enter to confirm"
-        read -r -a config_interfaces_arr
-        echo
-    else
-        readarray -td, config_interfaces_arr <<<"$CONFIG_RFKILL_INTERFACES,"
-        unset 'config_interfaces_arr[-1]'
-    fi
-    echo -e "Interfaces to block: ${config_interfaces_arr[*]}"
-    rfkill block "${config_interfaces_arr[@]}"
-    return 0
+    output_ref=()
+    [[ -n "${target_list}" ]] || {
+        printf 'CONFIG_RFKILL_TARGETS must not be empty\n' >&2
+        return 1
+    }
+
+    IFS=, read -r -a raw_targets <<<"${target_list}"
+    for target in "${raw_targets[@]}"; do
+        target="${target#"${target%%[![:space:]]*}"}"
+        target="${target%"${target##*[![:space:]]}"}"
+
+        case "${target}" in
+            all | wlan | wifi | bluetooth | uwb | ultrawideband | \
+                wimax | wwan | gps | fm | nfc)
+                ;;
+            *)
+                [[ "${target}" =~ ^[0-9]+$ ]] || {
+                    printf 'Invalid RFKill target: %s\n' \
+                        "${target:-<empty>}" >&2
+                    return 1
+                }
+                ;;
+        esac
+        output_ref+=("${target}")
+    done
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+validateRfkillTargets() {
+    local -a targets=()
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/init.conf"
-    . "$SCRIPT_D/utils.sh"
-    checkSU || exit 1
-    blockRf
-    exit $?
-fi
+    parseRfkillTargets "${1:-}" targets
+}
+
+blockRf() {
+    local -a targets=()
+
+    checkCommand rfkill || return 1
+    parseRfkillTargets "${CONFIG_RFKILL_TARGETS:-}" targets
+
+    printf '\nRFKill targets to block: %s\n' "${targets[*]}"
+    rfkill block "${targets[@]}"
+}

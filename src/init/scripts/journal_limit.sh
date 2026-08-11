@@ -1,35 +1,67 @@
 #!/usr/bin/env bash
 
-limitJournal() {
-    # Defaults
-    local config_journal_system_max_default="250M"
-    local config_journal_file_max_default="50M"
-    # Dirs
-    local journal_conf_d="/etc/systemd/journald.conf.d"
-    local journal_conf_f="${journal_conf_d}/size.conf"
+# Provisioning module: persistent journal limits.
+#
+# Installs an administrator drop-in for systemd-journald. This module does not
+# change the journal storage mode: System* settings apply only when persistent
+# storage under /var/log/journal is enabled.
 
-    # Apply default if conf is not found
-    local system_max="${CONFIG_JOURNAL_SYSTEM_MAX:=$config_journal_system_max_default}"
-    local file_max="${CONFIG_JOURNAL_FILE_MAX:=$config_journal_file_max_default}"
+validateJournalLimits() {
+    local setting
+    local value
 
-    echo -e "\n\nLimit journal size"
-    mkdir -p "$journal_conf_d"
-    echo "Using SystemMaxUse=$system_max | SystemMaxFileSize=$file_max"
-    echo -e "[Journal]\nSystemMaxUse=$system_max\nSystemMaxFileSize=$file_max" | tee "$journal_conf_f" >/dev/null
-    echo "New conf file is located at $journal_conf_f"
-    echo "Journal size limited"
-    return 0
+    for setting in \
+        CONFIG_JOURNAL_SYSTEM_MAX_USE \
+        CONFIG_JOURNAL_SYSTEM_MAX_FILE_SIZE; do
+        value="${!setting:-}"
+        [[ "${value}" =~ ^[0-9]+[KMGTPE]?$ ]] || {
+            printf '%s must be a size in bytes or use K, M, G, T, P or E\n' \
+                "${setting}" >&2
+            return 1
+        }
+    done
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+limitJournal() {
+    local journal_conf_d="${1:-/etc/systemd/journald.conf.d}"
+    local journal_conf_f="${journal_conf_d}/90-linux-scripts-journal-limits.conf"
+    local legacy_conf_f="${journal_conf_d}/size.conf"
+    local system_max_use="${CONFIG_JOURNAL_SYSTEM_MAX_USE:-}"
+    local system_max_file_size="${CONFIG_JOURNAL_SYSTEM_MAX_FILE_SIZE:-}"
+    local temporary_conf
+    local configuration_changed=false
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/init.conf"
-    . "$SCRIPT_D/utils.sh"
-    checkSU || exit 1
-    limitJournal
-    exit $?
-fi
+    validateJournalLimits
+    install -d -m 0755 -- "${journal_conf_d}"
+    temporary_conf="$(mktemp "${journal_conf_d}/.journal-limits.XXXXXX")"
+    if ! printf '[Journal]\nSystemMaxUse=%s\nSystemMaxFileSize=%s\n' \
+        "${system_max_use}" "${system_max_file_size}" >"${temporary_conf}" ||
+        ! chmod 0644 -- "${temporary_conf}"; then
+        rm -f -- "${temporary_conf}"
+        return 1
+    fi
+
+    if cmp -s -- "${temporary_conf}" "${journal_conf_f}"; then
+        rm -f -- "${temporary_conf}"
+    else
+        if ! mv -f -- "${temporary_conf}" "${journal_conf_f}"; then
+            rm -f -- "${temporary_conf}"
+            return 1
+        fi
+        configuration_changed=true
+    fi
+
+    # Remove only the drop-in written by older releases of this module.
+    if [[ -e "${legacy_conf_f}" || -L "${legacy_conf_f}" ]]; then
+        rm -f -- "${legacy_conf_f}"
+        configuration_changed=true
+    fi
+
+    if [[ "${configuration_changed}" == false ]]; then
+        printf 'Journal limits are already current: %s\n' "${journal_conf_f}"
+        return 0
+    fi
+
+    systemctl reload-or-restart systemd-journald.service
+    printf 'Journal limits updated: %s\n' "${journal_conf_f}"
+}

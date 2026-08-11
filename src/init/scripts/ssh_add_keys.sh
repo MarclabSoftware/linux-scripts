@@ -1,49 +1,94 @@
 #!/usr/bin/env bash
 
-addSSHKeys() {
-    echo -e "\n\nAdding SSH keys"
+# Provisioning Module: SSH Authorized Keys
+# Version: 3.0.0
+# Updated: 2026-08-09
+# Validates and atomically installs one optional public key for root and the
+# provisioned user. Existing authorized_keys entries are preserved.
+# Configuration and helpers are injected by init.sh.
+# shellcheck disable=SC2154,SC2310
 
-    if isVarEmpty "$CONFIG_SSH_KEY_USER"; then
-        echo "Missing CONFIG_SSH_KEY_USER"
-        echo -e "Please insert public SSH key for $CONFIG_USER and press Enter\nEG: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB8Ht8Z3j6yDWPBHQtOp/R9rjWvfMYo3MSA/K6q8D86r\nLeave empty to skip\n"
-        read -r
-        CONFIG_SSH_KEY_USER="$REPLY"
+validateSSHPublicKey() {
+    local public_key="$1"
+    local owner="$2"
+
+    [[ -n "${public_key}" ]] || return 0
+    if ! printf '%s\n' "${public_key}" |
+        ssh-keygen -l -f - >/dev/null 2>&1; then
+        printf 'Invalid SSH public key configured for %s\n' "${owner}" >&2
+        return 1
     fi
-
-    if isVarEmpty "$CONFIG_SSH_KEY_USER"; then
-        echo "Empty key for $CONFIG_USER, skipping"
-    else
-        echo "$CONFIG_SSH_KEY_USER" | tee -a "$SSH_AUTH_KEYS_USER_F" >/dev/null
-    fi
-
-    if isVarEmpty "$CONFIG_SSH_KEY_ROOT"; then
-        echo "Missing CONFIG_SSH_KEY_ROOT"
-        echo -e "Please insert public SSH key for root and press Enter\nEG: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB8Ht8Z3j6yDWPBHQtOp/R9rjWvfMYo3MSA/K6q8D86r\nLeave empty to skip\n"
-        read -r
-        CONFIG_SSH_KEY_ROOT="$REPLY"
-    fi
-
-    if isVarEmpty "$CONFIG_SSH_KEY_ROOT"; then
-        echo "Empty key for root, skipping"
-    else
-        echo "$CONFIG_SSH_KEY_ROOT" | tee -a "$SSH_AUTH_KEYS_ROOT_F" >/dev/null
-    fi
-
-    echo "SSH keys added"
-    return 0
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+validateSSHKeyConfiguration() {
+    command -v ssh-keygen >/dev/null 2>&1 || {
+        printf 'ssh-keygen command not found\n' >&2
+        return 1
+    }
+    [[ -n "${CONFIG_SSH_KEY_USER:-}" || -n "${CONFIG_SSH_KEY_ROOT:-}" ]] || {
+        printf 'At least one SSH public key must be configured\n' >&2
+        return 1
+    }
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/init.conf"
-    . "$SCRIPT_D/utils.sh"
-    . "$SCRIPT_D/ssh_prepare.sh"
-    checkSU || exit 1
-    prepareSSH || exit 1
-    addSSHKeys
-    exit $?
-fi
+    validateSSHPublicKey "${CONFIG_SSH_KEY_USER:-}" "${CONFIG_USER}" || return
+    validateSSHPublicKey "${CONFIG_SSH_KEY_ROOT:-}" root
+}
+
+installSSHPublicKey() {
+    local public_key="$1"
+    local ssh_dir="$2"
+    local owner="$3"
+    local group="$4"
+    local destination="${ssh_dir}/authorized_keys"
+    local temporary
+
+    [[ -n "${public_key}" ]] || return 0
+    [[ ! -L "${ssh_dir}" && ! -L "${destination}" ]] || {
+        printf 'Refusing symbolic SSH path for %s\n' "${owner}" >&2
+        return 1
+    }
+
+    install -d -o "${owner}" -g "${group}" -m 0700 -- "${ssh_dir}" || return
+    if [[ -e "${destination}" ]]; then
+        [[ -f "${destination}" ]] || {
+            printf 'authorized_keys is not a regular file: %s\n' \
+                "${destination}" >&2
+            return 1
+        }
+        if grep -qxF -- "${public_key}" "${destination}"; then
+            chown "${owner}:${group}" "${destination}" || return
+            chmod 0600 -- "${destination}" || return
+            return 0
+        fi
+    fi
+
+    temporary="$(mktemp -- "${ssh_dir}/.authorized_keys.XXXXXX")" || return
+    if [[ -e "${destination}" ]]; then
+        if ! awk '1' "${destination}" >"${temporary}"; then
+            rm -f -- "${temporary}"
+            return 1
+        fi
+    fi
+    if ! printf '%s\n' "${public_key}" >>"${temporary}" ||
+        ! install -o "${owner}" -g "${group}" -m 0600 \
+            -- "${temporary}" "${destination}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    rm -f -- "${temporary}"
+}
+
+addSSHKeys() {
+    local user_home="${1:-${HOME_USER_D}}"
+    local root_home="${2:-${HOME_ROOT_D}}"
+    local user_group
+
+    validateSSHKeyConfiguration || return
+    user_group="$(id -gn -- "${CONFIG_USER}")" || return
+
+    installSSHPublicKey "${CONFIG_SSH_KEY_USER:-}" \
+        "${user_home}/.ssh" "${CONFIG_USER}" "${user_group}" || return
+    installSSHPublicKey "${CONFIG_SSH_KEY_ROOT:-}" \
+        "${root_home}/.ssh" root root || return
+    printf 'SSH public keys installed\n'
+}

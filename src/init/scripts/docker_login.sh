@@ -1,60 +1,54 @@
 #!/usr/bin/env bash
 
-dockerLogin() {
-    echo -e "\n\nDocker login"
+# Provisioning Module: Docker Login
+# Version: 3.0.0
+# Updated: 2026-08-09
+# Performs an interactive registry login as the configured normal user.
+# Docker Hub's device-code flow can be completed from any browser, so the
+# target host does not need a graphical session. Setting a username instead
+# uses Docker's hidden password or personal-access-token prompt over the
+# current terminal. Secrets are deliberately never accepted through init.env.
+# Configuration and helpers are injected by init.sh.
+# shellcheck disable=SC2154
 
-    local docker_group="docker"
+validateDockerLoginConfiguration() {
+    local registry="${CONFIG_DOCKER_REGISTRY:-}"
+    local username="${CONFIG_DOCKER_USERNAME:-}"
 
-    if ! checkCommand "docker"; then
-        echo >&2 "docker command missing, cannot proceed"
+    if [[ "${registry}" == -* ||
+        "${registry}" == */* ||
+        "${registry}" == *[[:space:]]* ]]; then
+        printf 'CONFIG_DOCKER_REGISTRY must be empty or hostname[:port]\n' >&2
         return 1
     fi
-
-    echo "Please prepare docker hub user and password"
-    paktc
-
-    if ! checkSU 2>/dev/null; then
-        if ! isMeInGroup "$docker_group"; then
-            echo >&2 -e "\nCurrent user isn't in $docker_group group, cannot proceed"
-            return 1
-        fi
-        docker login
-        return 0
-    fi
-
-    if isVarEmpty "$CONFIG_USER"; then
-        echo -e "\nMissing CONFIG_USER, please enter the normal user name and press enter\n"
-        read -r
-        CONFIG_USER="$REPLY"
-    fi
-
-    if ! isNormalUser "$CONFIG_USER"; then
-        echo >&2 -e "\nCONFIG_USER problem, it must be set, it must be a normal user, it must exists"
+    if [[ "${username}" == *[[:space:]]* ]]; then
+        printf 'CONFIG_DOCKER_USERNAME must not contain whitespace\n' >&2
         return 1
     fi
-
-    if ! isUserInGroup "$CONFIG_USER" "$docker_group"; then
-        echo >&2 -e "\nCONFIG_USER found, $CONFIG_USER isn't in $docker_group group"
-        read -p "Do you want to add $CONFIG_USER to $docker_group group? Y/N: " -n 1 -r
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            usermod -aG "$docker_group" "$CONFIG_USER"
-        else
-            echo >&2 "Cannot proceed"
-            return 1
-        fi
-    fi
-    sudo -u "$CONFIG_USER" docker login
-    return 0
 }
 
-# Check if script is executed or sourced
-(return 0 2>/dev/null) && sourced=true || sourced=false
+dockerLogin() {
+    local docker_path registry target username
+    local -a login_command
 
-if [ "$sourced" = false ]; then
-    SCRIPT_D=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    # Source needed files
-    . "$SCRIPT_D/utils.sh"
-    . "$SCRIPT_D/init.conf"
-    dockerLogin
-    exit $?
-fi
+    validateDockerLoginConfiguration || return
+    checkCommand docker || return
+    checkCommand sudo || return
+
+    docker_path="$(command -v docker)"
+    registry="${CONFIG_DOCKER_REGISTRY:-}"
+    username="${CONFIG_DOCKER_USERNAME:-}"
+    target="${registry:-Docker Hub}"
+    login_command=("${docker_path}" login)
+    [[ -z "${username}" ]] || login_command+=(--username "${username}")
+    [[ -z "${registry}" ]] || login_command+=("${registry}")
+
+    printf '\nDocker registry login: %s\n' "${target}"
+    if [[ -z "${registry}" && -z "${username}" ]]; then
+        printf 'Complete the displayed device code from any browser.\n'
+    else
+        printf 'Enter credentials in this terminal when prompted.\n'
+    fi
+
+    sudo -H -u "${CONFIG_USER}" -- "${login_command[@]}"
+}
