@@ -177,11 +177,11 @@ Description:
 Options:
     -c syntax   Provider and country list specification. [Mandatory]
                 Format: 'provider:CC,CC;provider:CC'
-                
+
                 Examples:
                   Single provider:   'ipdeny:US,CA'
                   Multiple providers: 'ripe:IT,FR;ipdeny:CN,KR;nirsoft:DE'
-                  
+
     -C          Validate configuration without downloading lists.
     -h          Display this help message.
 
@@ -920,7 +920,7 @@ download_provider_ripe() {
         # $4 = Start IP
         # $5 = Value (Host count for IPv4, Prefix length for IPv6)
         # $7 = Status (allocated, assigned)
-        
+
         ($2 in target_countries && ($7 == "allocated" || $7 == "assigned")) {
             if ($3 == "ipv4") {
                 # IPv4: Convert host count to CIDR and append to the countrys v4 file

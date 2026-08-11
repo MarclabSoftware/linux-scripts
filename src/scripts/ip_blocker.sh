@@ -2305,7 +2305,7 @@ EOF
             echo "                oifname \"${iface}\" masquerade"
         done
         cat <<EOF
-            }  
+            }
         }
 EOF
     ) >"${nft_config_file}"
