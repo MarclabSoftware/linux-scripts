@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # LG webOS Developer Mode Session Renewer
-# Version: 2.0.0
-# Updated: 2026-07-29
+# Version: 2.1.0
+# Updated: 2026-08-15
 #
 # Reads the current Developer Mode token over SSH and submits it to LG's renewal
 # endpoint. A cached token is used only when the TV is temporarily unavailable.
@@ -15,6 +15,7 @@ umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly DEFAULT_ENV_FILE="${SCRIPT_DIR}/webos_devmode.env"
+readonly EX_TEMPFAIL=75
 
 die() {
     printf 'webos_devmode: %s\n' "$*" >&2
@@ -92,8 +93,8 @@ require_command ssh
 mkdir -p -- "${TOKEN_CACHE%/*}" "${KNOWN_HOSTS%/*}"
 chmod 0700 -- "${TOKEN_CACHE%/*}" "${KNOWN_HOSTS%/*}"
 
-session_token=""
-if session_token="$(
+ssh_status=0
+session_token="$(
     ssh \
         -i "${PRIVATE_KEY}" \
         -p "${PORT}" \
@@ -107,23 +108,38 @@ if session_token="$(
         -o UserKnownHostsFile="${KNOWN_HOSTS}" \
         "${USERNAME}@${HOST}" \
         cat /var/luna/preferences/devmode_enabled
-)" && [[ -n "${session_token}" ]]; then
-    token_tmp="$(mktemp -- "${TOKEN_CACHE}.tmp.XXXXXX")"
-    printf '%s\n' "${session_token}" >"${token_tmp}"
-    mv -f -- "${token_tmp}" "${TOKEN_CACHE}"
+)" || ssh_status=$?
+
+if ((ssh_status == 0)) && [[ -n ${session_token} ]]; then
+    :
 elif [[ -r "${TOKEN_CACHE}" ]]; then
     session_token="$(<"${TOKEN_CACHE}")"
+elif ((ssh_status == 255)); then
+    printf '%s\n' \
+        'webos_devmode: TV unavailable and no cached token; retry deferred' >&2
+    exit "${EX_TEMPFAIL}"
+elif ((ssh_status == 0)); then
+    die "the TV returned an empty session token"
 else
-    die "could not obtain a session token and no cached token is available"
+    die "remote token command failed (SSH exit ${ssh_status})"
 fi
 
 [[ -n "${session_token}" ]] || die "the session token is empty"
+
+# Normalize both fresh and legacy cached tokens, then let curl read the value
+# from the owner-only file so it never appears in process arguments.
+token_tmp="$(mktemp -- "${TOKEN_CACHE}.tmp.XXXXXX")"
+printf '%s' "${session_token}" >"${token_tmp}"
+mv -f -- "${token_tmp}" "${TOKEN_CACHE}"
+chmod 0600 -- "${TOKEN_CACHE}"
+unset session_token token_tmp
+
 curl \
     --fail \
     --get \
     --max-time "${REQUEST_TIMEOUT}" \
     --show-error \
     --silent \
-    --data-urlencode "sessionToken=${session_token}" \
+    --data-urlencode "sessionToken@${TOKEN_CACHE}" \
     "${API_URL}"
 printf '\n'

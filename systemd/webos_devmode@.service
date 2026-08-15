@@ -9,6 +9,7 @@ After=network-online.target
 Type=oneshot
 User=%i
 Group=%i
+SuccessExitStatus=75
 Environment=WEBOS_TOKEN_CACHE=/var/lib/webos_devmode-%i/session_token
 Environment=WEBOS_KNOWN_HOSTS=/var/lib/webos_devmode-%i/known_hosts
 ExecStart=/home/%i/scripts/webos_devmode.sh
