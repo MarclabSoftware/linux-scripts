@@ -51,6 +51,28 @@ for file in "${scripts[@]}"; do
     esac
 done
 
+# Git executable bits are part of the release: a fresh clone must be directly
+# usable even when the current worktree happens to have permissive modes.
+entrypoints=(build.sh check.sh src/bootstrap.sh src/init/init.sh)
+for file in "${scripts[@]}"; do
+    case ${file} in
+        src/scripts/media/media_common.sh | src/init/* | tests/*) ;;
+        src/scripts/*) entrypoints+=("${file}") ;;
+        *) ;;
+    esac
+done
+for file in "${entrypoints[@]}"; do
+    [[ -x ${file} ]] || die "entry point is not executable: ${file}"
+    # Untracked scripts have no index entry yet; their filesystem mode is
+    # checked above and Git will record it when they are added.
+    # shellcheck disable=SC2312
+    index_entry=$(git ls-files -s -- "${file}")
+    case ${index_entry} in
+        "" | 100755\ *) ;;
+        *) die "entry point is not executable in Git: ${file}" ;;
+    esac
+done
+
 if grep -nHE '[[:blank:]]+$' "${scripts[@]}"; then
     die "trailing whitespace found"
 fi
@@ -78,8 +100,19 @@ for test_file in "${tests[@]}"; do
     bash "${test_file}"
 done
 
+# Scan every file that Git could commit, including untracked units and
+# documentation, while naturally excluding ignored private inventories.
+# shellcheck disable=SC2312
+mapfile -d '' -t candidates < <(
+    git ls-files -z --cached --others --exclude-standard
+)
+repository_files=()
+for file in "${candidates[@]}"; do
+    [[ -f ${file} ]] && repository_files+=("${file}")
+done
+
 {
-    for file in "${scripts[@]}" "${env_examples[@]}"; do
+    for file in "${repository_files[@]}"; do
         printf '\n# file: %s\n' "${file}"
         cat -- "${file}"
     done
