@@ -117,6 +117,8 @@ done
         cat -- "${file}"
     done
 } | gitleaks stdin --no-banner --redact
+git diff --cached --no-ext-diff --no-textconv |
+    gitleaks stdin --no-banner --redact
 gitleaks git --no-banner --redact .
 
 printf 'All checks passed\n'
