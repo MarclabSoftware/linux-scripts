@@ -175,6 +175,34 @@ before installing any public example under `/etc/systemd/system/`.
 Private sidecars, generated artifacts, credentials and logs are excluded by
 `.gitignore`. Check `git status` before every commit anyway.
 
+### Standalone component catalog
+
+| Component | Purpose | Configuration / integration |
+| --- | --- | --- |
+| `cert_monitor.sh` | Export NPM/NPMplus certificates | `.env`, service |
+| `clone_disk.sh` | Clone a live Linux system disk | CLI |
+| `cold_backup.sh` | Copy selected data to cold storage | `.env` |
+| `devices.sh` | Inventory attached USB devices | CLI |
+| `docker_network.sh` | Reconcile a Docker bridge | `.env`, service |
+| `ethtool_optimizations.sh` | Apply interface offload settings | `.env`, service |
+| `geo_ip_downloader.sh` + `ip_blocker.sh` | Build Geo-IP sets and enforce the host firewall | two `.env` files, service, timer |
+| `media/` | Validate, convert and archive media | two `.env` files |
+| `npmplus_ech_cloudflare.sh` | Publish rotating NPMplus ECH keys to Cloudflare | owner-only `.env`, NPMplus cron hook |
+| `power_state.sh` | Publish power state over a Mosquitto Unix socket | `.env`, `.conf`, service, udev rule |
+| `ssh_audit.sh` | Update and run the latest upstream `ssh-audit` | user cache |
+| `update_arch.sh` | Apply Arch Linux updates with configured exclusions | `.env`, `.paths` |
+| `update_debian.sh` | Apply Debian updates with configured exclusions | `.env`, `.paths` |
+| `update_zbdonglee.sh` | Update supported Zigbee coordinators | `.env` |
+| Vaultwarden backup scripts | Send, receive and restore encrypted backups | `.env` files, service, timer |
+| `webos_devmode.sh` | Renew LG webOS Developer Mode | `.env`, service, timer |
+| Console, keyboard-backlight and Unbound units | Systemd-only helpers | units only |
+| `npm_cleaner.sh` | Clean legacy NPM certificate archives | `.env` |
+| `argonone_install.sh`, `pigpiod_install.sh` | Hardware-specific installers | CLI |
+
+`media_common.sh` is a sourced library; every other file under `src/scripts/`
+is an executable entry point. `clone_disk.sh` is storage-layout-sensitive and
+must be reviewed before use on a different system.
+
 ## Development checks
 
 The tests are development safeguards; they are not needed on managed servers
@@ -204,6 +232,7 @@ the artifact format and corruption checks (`test_build.sh`), the provisioner and
 its modules (`test_init_*.sh`), and the standalone scripts (`test_*.sh`).
 
 `./check.sh` runs strict ShellCheck (`--severity=style --enable=all`), shfmt,
-Bash or Dash syntax checks, checkbashisms, all Bash tests and both
-staged-content and repository-history secret scans with Gitleaks. It stops and
-names any missing checker instead of silently skipping it.
+Bash or Dash syntax checks, checkbashisms, executable-mode and systemd-template
+checks, all Bash tests, and Gitleaks scans of committable files, the staged diff
+and repository history. It stops and names any missing checker instead of
+silently skipping it.
