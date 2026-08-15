@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 
 # SSH Security Audit
-# Version: 2.0.0
-# Updated: 2026-07-29
+# Version: 2.1.0
+# Updated: 2026-08-15
 #
 # Keeps a shallow ssh-audit checkout in the user cache and audits either the
 # arguments supplied by the caller or the local SSH daemon. When run inside an
 # SSH session, the local daemon port is inferred from SSH_CONNECTION.
 
 set -Eeuo pipefail
+umask 077
 
 readonly GIT_URL="https://github.com/jtesta/ssh-audit.git"
 readonly TOOL_DIR="${SSH_AUDIT_TOOL_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/ssh-audit}"
 
+audit_stderr=
 trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
+trap 'rm -f -- "${audit_stderr}"' EXIT
 
 # The ERR trap invokes this function indirectly.
 # shellcheck disable=SC2317,SC2329
@@ -109,9 +112,30 @@ main() {
     fi
 
     log "INFO" "Running ssh-audit..."
-    "${TOOL_DIR}/ssh-audit.py" "${audit_params[@]}" || true
+    audit_stderr="$(mktemp "${TMPDIR:-/tmp}/ssh_audit.XXXXXX")"
+    local audit_status=0
+    "${TOOL_DIR}/ssh-audit.py" "${audit_params[@]}" 2>"${audit_stderr}" ||
+        audit_status=$?
+    cat -- "${audit_stderr}" >&2
 
-    log "INFO" "Audit completed successfully"
+    case ${audit_status} in
+        0)
+            log "INFO" "Audit completed successfully"
+            ;;
+        2 | 3)
+            # ssh-audit uses 2 and 3 for completed audits containing warning
+            # or failure findings. argparse also uses 2, but emits usage text.
+            if ((audit_status == 2)) && grep -q '^usage:' "${audit_stderr}"; then
+                log "ERROR" "ssh-audit rejected its arguments"
+                exit "${audit_status}"
+            fi
+            log "WARN" "Audit completed with security findings (exit ${audit_status})"
+            ;;
+        *)
+            log "ERROR" "ssh-audit execution failed (exit ${audit_status})"
+            exit "${audit_status}"
+            ;;
+    esac
 }
 
 main "$@"
