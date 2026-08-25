@@ -33,6 +33,7 @@ done
 
 instance_units=("${SYSTEMD_DIR}"/*@.*)
 for instance_unit in "${instance_units[@]}"; do
+    [[ -f ${instance_unit} ]] || continue
     if ! grep -q '^# Instance:' "${instance_unit}" ||
         ! grep -q '^# Example:' "${instance_unit}"; then
         printf 'template lacks instance documentation: %s\n' "${instance_unit}" >&2
