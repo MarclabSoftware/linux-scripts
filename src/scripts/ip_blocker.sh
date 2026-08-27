@@ -2219,9 +2219,9 @@ EOF
                 ip6 saddr @private_nets_v6 accept
 
                 # 3. CRITICAL: Allow all ICMPv6 *before* geo-blocking.
-                #    This is required for Neighbor Discovery (NDP) to work.
-                #    Blocking this breaks IPv6 connectivity completely.
-                ip6 nexthdr icmpv6 accept
+                #    NDP and MLD require it; meta l4proto also sees ICMPv6
+                #    behind IPv6 extension headers such as Hop-by-Hop.
+                meta nfproto ipv6 meta l4proto ipv6-icmp accept
 
                 # 4. Geo-IP v4 Filter (DROP)
                 #    Drop all NEW traffic that is NOT in the allowlist.
@@ -2232,8 +2232,8 @@ EOF
                 # 5. Geo-IP v6 Filter (DROP, if enabled)
 EOF
         if [[ "${GEOBLOCK_IPV6}" == true ]]; then
-            echo '                ip6 nexthdr != icmpv6 ip6 saddr != @'"${ALLOW_LIST_NAME_V6}"' limit rate 30/minute burst 10 packets log prefix "PREROUTING6 GEO-DROP: "'
-            echo '                ip6 nexthdr != icmpv6 ip6 saddr != @'"${ALLOW_LIST_NAME_V6}"' counter drop'
+            echo '                ip6 saddr != @'"${ALLOW_LIST_NAME_V6}"' limit rate 30/minute burst 10 packets log prefix "PREROUTING6 GEO-DROP: "'
+            echo '                ip6 saddr != @'"${ALLOW_LIST_NAME_V6}"' counter drop'
         fi
         cat <<EOF
             }

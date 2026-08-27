@@ -22,6 +22,16 @@ IP_BLOCKER_ENV_FILE="${ip_blocker_env}" \
     "${REPO_ROOT}/src/scripts/ip_blocker.sh" -C |
     grep -Fx 'ip_blocker configuration is valid' >/dev/null
 
+# ICMPv6 can follow extension headers (MLDv2 uses Hop-by-Hop), so nftables
+# must inspect the resolved layer-4 protocol rather than the immediate header.
+grep -F 'meta nfproto ipv6 meta l4proto ipv6-icmp accept' \
+    "${REPO_ROOT}/src/scripts/ip_blocker.sh" >/dev/null
+if grep -Eq 'ip6 nexthdr.*(icmpv6|ipv6-icmp)' \
+    "${REPO_ROOT}/src/scripts/ip_blocker.sh" >/dev/null; then
+    printf 'ip_blocker uses extension-header-unsafe ICMPv6 matching\n' >&2
+    exit 1
+fi
+
 geoip_env="${TEST_TMP}/geoip.env"
 cat >"${geoip_env}" <<'EOF'
 GEOIP_COUNTRIES='ripe:IT,FR;ipdeny:US,CA;nirsoft:DE'
