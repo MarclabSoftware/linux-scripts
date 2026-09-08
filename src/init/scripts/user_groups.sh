@@ -7,7 +7,6 @@
 # are never removed.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 parseUserGroupList() {
     if (($# != 2)) || [[ -z "$2" ]]; then
@@ -63,6 +62,7 @@ addUserToGroups() {
     local -a configured_groups=()
     local -a missing_groups=()
 
+    # shellcheck disable=SC2154
     isNormalUser "${CONFIG_USER}" || {
         printf 'CONFIG_USER must name an existing non-root user\n' >&2
         return 1

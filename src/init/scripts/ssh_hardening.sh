@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: OpenSSH Hardening
-# Version: 4.1.0
-# Updated: 2026-08-11
 # Rotates the server host keys once, then keeps validating and updating a small
 # sshd drop-in while preserving distribution settings and algorithm defaults.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154,SC2310
 
 validateSSHHardeningConfiguration() {
     local port="${CONFIG_SSH_PORT:-}"
@@ -47,6 +44,7 @@ validateSSHHardeningConfiguration() {
         return 1
     fi
 
+    # shellcheck disable=SC2154
     if declaration="$(declare -p CONFIG_SSH_EXTRA_DIRECTIVES 2>/dev/null)"; then
         [[ "${declaration}" == "declare -a "* ]] || {
             printf 'CONFIG_SSH_EXTRA_DIRECTIVES must be an indexed array\n' >&2
@@ -308,7 +306,7 @@ restoreSSHConfig() {
 
 validateSSHHostKeyInventory() {
     local host_key_dir="$1"
-    local key_name certificate
+    local key_name certificate suffix key_file
     local -a key_names=(rsa ecdsa ed25519 dsa xmss mldsa44_ed25519)
 
     for key_name in "${key_names[@]}"; do
@@ -318,6 +316,14 @@ validateSSHHostKeyInventory() {
                 "${certificate}" >&2
             return 1
         }
+        for suffix in '' .pub; do
+            key_file="${host_key_dir}/ssh_host_${key_name}_key${suffix}"
+            [[ -e "${key_file}" || -L "${key_file}" ]] || continue
+            [[ -f "${key_file}" && ! -L "${key_file}" ]] || {
+                printf 'Invalid OpenSSH host-key file: %s\n' "${key_file}" >&2
+                return 1
+            }
+        done
     done
 }
 
@@ -403,17 +409,17 @@ backupSSHHostKeys() {
     local key_name suffix source_file
     local -a key_names=(rsa ecdsa ed25519 dsa xmss mldsa44_ed25519)
 
+    # Reject the complete inventory before moving the first original.
+    validateSSHHostKeyInventory "${host_key_dir}" || return
     for key_name in "${key_names[@]}"; do
         for suffix in '' .pub; do
             source_file="${host_key_dir}/ssh_host_${key_name}_key${suffix}"
             [[ -e "${source_file}" || -L "${source_file}" ]] || continue
-            [[ -f "${source_file}" && ! -L "${source_file}" ]] || {
-                printf 'Invalid OpenSSH host-key file: %s\n' "${source_file}" >&2
-                return 1
-            }
             mv -- "${source_file}" "${backup_dir}/" || return
         done
     done
+    # Only a complete backup permits removal of newly installed key names.
+    : >"${backup_dir}/.complete"
 }
 
 installSSHHostKeys() {
@@ -445,10 +451,14 @@ restoreSSHHostKeys() {
     for key_name in "${key_names[@]}"; do
         for suffix in '' .pub; do
             target_file="${host_key_dir}/ssh_host_${key_name}_key${suffix}"
-            rm -f -- "${target_file}" || return
             backup_file="${backup_dir}/${target_file##*/}"
-            [[ -e "${backup_file}" ]] || continue
-            mv -- "${backup_file}" "${target_file}" || return
+            if [[ -f "${backup_file}" && ! -L "${backup_file}" ]]; then
+                # Keep the backup until the entire rollback succeeds, so an
+                # interrupted recovery can be retried without losing originals.
+                cp -aT --remove-destination -- "${backup_file}" "${target_file}" || return
+            elif [[ -f "${backup_dir}/.complete" ]]; then
+                rm -f -- "${target_file}" || return
+            fi
         done
     done
 }
@@ -508,12 +518,14 @@ hardenSSH() {
     local target_existed=false
     local include_mldsa=false
     local rotate_keys=false
+    local config_changed=true
 
     validateSSHHardeningConfiguration || return
     checkCommand sshd || return
     checkCommand ssh || return
     checkCommand ssh-keygen || return
     checkCommand systemctl || return
+    # shellcheck disable=SC2154
     validateSSHUserAccess "${HOME_USER_D}" "${CONFIG_USER}" || return
     active_service="$(activeSSHService)" || {
         printf 'OpenSSH must be active before hardening\n' >&2
@@ -647,6 +659,7 @@ hardenSSH() {
         return 1
     fi
 
+    cmp -s -- "${candidate}" "${target_config}" && config_changed=false
     if ! installConfigFile "${target_config}" <"${candidate}" ||
         ! chown root:root "${target_config}" ||
         ! sshd -t ||
@@ -666,7 +679,8 @@ hardenSSH() {
         return 1
     fi
 
-    if ! systemctl reload "${active_service}"; then
+    if [[ "${rotate_keys}" == true || "${config_changed}" == true ]] &&
+        ! systemctl reload "${active_service}"; then
         if ! rollbackSSHChanges "${target_config}" "${rollback_file}" \
             "${target_existed}" "${host_key_dir}" "${old_key_dir}" \
             "${rotate_keys}"; then

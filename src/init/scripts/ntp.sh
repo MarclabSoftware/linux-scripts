@@ -7,7 +7,6 @@
 # Chrony is always client-only and can require NTS authentication.
 #
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 validateNtpServerList() {
     local variable_name="$1"
@@ -76,6 +75,7 @@ validateNtpConfiguration() {
         printf 'CONFIG_NTP_CHRONY_MIN_SOURCES must be a positive integer\n' >&2
         return 1
     }
+    # shellcheck disable=SC2154
     read -r -a servers <<<"${CONFIG_NTP_SERVERS}"
     server_count="${#servers[@]}"
     ((minimum_sources <= server_count)) || {
@@ -94,6 +94,7 @@ validateNtpConfiguration() {
 }
 
 renderTimesyncdConfig() {
+    # shellcheck disable=SC2154
     cat <<EOF
 # Managed by linux-scripts. Local changes will be replaced.
 
@@ -169,9 +170,14 @@ disableNtpUnitIfPresent() {
 activateNtpUnit() {
     local selected_unit="$1"
     local conflicting_unit="$2"
+    local config_changed="$3"
 
     systemctl enable "${selected_unit}" || return
-    systemctl restart "${selected_unit}" || return
+    if [[ "${config_changed}" == true ]]; then
+        systemctl restart "${selected_unit}" || return
+    else
+        systemctl start "${selected_unit}" || return
+    fi
     systemctl is-active --quiet "${selected_unit}" || return
     disableNtpUnitIfPresent "${conflicting_unit}"
 }
@@ -180,6 +186,7 @@ configureTimesyncd() {
     local root_prefix="$1"
     local config_file="${root_prefix}/etc/systemd/timesyncd.conf.d/90-linux-scripts-ntp.conf"
     local candidate
+    local config_changed=true
 
     systemctl cat systemd-timesyncd.service >/dev/null 2>&1 || {
         printf 'systemd-timesyncd is not installed\n' >&2
@@ -187,20 +194,25 @@ configureTimesyncd() {
     }
 
     candidate="$(mktemp)" || return
-    if ! renderTimesyncdConfig >"${candidate}" ||
-        ! installConfigFile "${config_file}" <"${candidate}"; then
+    if ! renderTimesyncdConfig >"${candidate}"; then
+        rm -f -- "${candidate}"
+        return 1
+    fi
+    cmp -s -- "${candidate}" "${config_file}" && config_changed=false
+    if ! installConfigFile "${config_file}" <"${candidate}"; then
         rm -f -- "${candidate}"
         return 1
     fi
     rm -f -- "${candidate}"
 
-    activateNtpUnit systemd-timesyncd.service chronyd.service
+    activateNtpUnit systemd-timesyncd.service chronyd.service "${config_changed}"
 }
 
 configureChrony() {
     local root_prefix="$1"
     local package_manager="$2"
     local config_file candidate
+    local config_changed=true
 
     case "${package_manager}" in
         pacman) config_file="${root_prefix}/etc/chrony.conf" ;;
@@ -225,13 +237,14 @@ configureChrony() {
         printf 'Generated Chrony configuration is invalid\n' >&2
         return 1
     fi
+    cmp -s -- "${candidate}" "${config_file}" && config_changed=false
     if ! installConfigFile "${config_file}" <"${candidate}"; then
         rm -f -- "${candidate}"
         return 1
     fi
     rm -f -- "${candidate}"
 
-    activateNtpUnit chronyd.service systemd-timesyncd.service
+    activateNtpUnit chronyd.service systemd-timesyncd.service "${config_changed}"
 }
 
 customNtp() {

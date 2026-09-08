@@ -6,7 +6,6 @@
 # once, and adds completion, colors and fzf without replacing the host's
 # distribution-provided .bashrc.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 renderBashProfile() {
     cat <<'EOF'
@@ -153,7 +152,9 @@ configureShellHome() {
 }
 
 configureShellEnvironment() {
+    # shellcheck disable=SC2154
     configureShellHome "${HOME_USER_D}" "${CONFIG_USER}" || return
+    # shellcheck disable=SC2154
     configureShellHome "${HOME_ROOT_D}" root || return
     printf 'Interactive Bash environment configured for %s and root\n' \
         "${CONFIG_USER}"

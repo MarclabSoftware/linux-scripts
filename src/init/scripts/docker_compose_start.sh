@@ -7,7 +7,6 @@
 # no working-directory mutation or project-directory override is required.
 #
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 validateDockerComposeConfiguration() {
     local compose_file="${CONFIG_DOCKER_COMPOSE_FILE_PATH:-}"

@@ -13,6 +13,37 @@ readonly BOOTSTRAP_FILE="${SCRIPT_DIR}/src/bootstrap.sh"
 readonly RUNNER_DELIMITER="__LINUX_INIT_RUNNER__"
 readonly PAYLOAD_DELIMITER="__LINUX_INIT_PAYLOAD__"
 
+# Deployment allowlist. Add a module here when init.sh starts using it; do not
+# discover payload files from the working tree, which may contain private data.
+readonly -a PAYLOAD_FILES=(
+    init.sh
+    scripts/backup_restore.sh
+    scripts/docker_compose_start.sh
+    scripts/docker_custom_bridge.sh
+    scripts/docker_daemon.sh
+    scripts/docker_login.sh
+    scripts/fstrim.sh
+    scripts/journal_limit.sh
+    scripts/memory.sh
+    scripts/nano_syntax_highlighting.sh
+    scripts/network.sh
+    scripts/ntp.sh
+    scripts/package_cleanup.sh
+    scripts/pacman_colors.sh
+    scripts/rfkill.sh
+    scripts/rpi_boot_config.sh
+    scripts/rpi_eeprom.sh
+    scripts/shell_environment.sh
+    scripts/ssh_add_hosts.sh
+    scripts/ssh_add_keys.sh
+    scripts/ssh_hardening.sh
+    scripts/system_update.sh
+    scripts/systemd_resolved.sh
+    scripts/user_groups.sh
+    scripts/user_passwordless_sudo.sh
+    scripts/utils.sh
+)
+
 config_file="${LINUX_INIT_CONFIG:-${SOURCE_DIR}/init.env}"
 output_file="${LINUX_INIT_OUTPUT:-${SCRIPT_DIR}/build/linux-init.sh}"
 
@@ -78,7 +109,7 @@ while (($# > 0)); do
     esac
 done
 
-for command_name in base64 bash cat chmod cp find grep mkdir mktemp mv \
+for command_name in base64 bash cat chmod cp grep mkdir mktemp mv \
     realpath rm sha256sum tar; do
     require_command "${command_name}"
 done
@@ -102,13 +133,7 @@ if [[ "${output_path}" == "${source_path}" ||
     die "output must be outside ${source_path}"
 fi
 [[ ! -d "${output_path}" ]] || die "output is a directory: ${output_path}"
-
-# Reuse the provisioner's own validation so build-time and run-time checks
-# cannot drift apart.
-if ! INIT_ENV_FILE="${config_path}" \
-    bash "${SOURCE_DIR}/init.sh" --check-config >/dev/null; then
-    die "configuration validation failed: ${config_path}"
-fi
+[[ "${output_path}" != "${config_path}" ]] || die "output must not overwrite the selected configuration"
 
 output_dir="${output_path%/*}"
 output_name="${output_path##*/}"
@@ -129,28 +154,26 @@ readonly work_dir temporary_output
 
 stage_dir="${work_dir}/payload"
 payload_archive="${work_dir}/payload.tar.gz"
-mkdir -p -- "${stage_dir}"
-cp -a -- "${SOURCE_DIR}/." "${stage_dir}/"
+mkdir -p -- "${stage_dir}/scripts"
+[[ ! -L "${SOURCE_DIR}" && ! -L "${SOURCE_DIR}/scripts" ]] ||
+    die "payload directories must not be symbolic links"
+for payload_file in "${PAYLOAD_FILES[@]}"; do
+    [[ -f "${SOURCE_DIR}/${payload_file}" && ! -L "${SOURCE_DIR}/${payload_file}" ]] ||
+        die "payload source must be a regular file: ${payload_file}"
+    cp -- "${SOURCE_DIR}/${payload_file}" "${stage_dir}/${payload_file}"
+done
 
 # Never include an arbitrary ignored init.env left in the source tree. Only the
 # configuration selected above is allowed into the deployment artifact.
-rm -f -- "${stage_dir}/init.env"
 cp -- "${config_path}" "${stage_dir}/init.env"
 chmod 0600 "${stage_dir}/init.env"
 
-# The archive is built only from regular files and directories. Rejecting
-# links and special files keeps extraction independent from tar implementation
-# details and prevents a payload from escaping its temporary directory.
-unsafe_path="$(find "${stage_dir}" -mindepth 1 \
-    ! -type f ! -type d -print -quit)"
-[[ -z "${unsafe_path}" ]] ||
-    die "unsupported payload file type: ${unsafe_path}"
-payload_path_list="${work_dir}/payload.paths"
-find "${stage_dir}" -mindepth 1 -print0 >"${payload_path_list}"
-while IFS= read -r -d '' payload_path; do
-    [[ "${payload_path}" != *[$'\r\n']* ]] ||
-        die "payload paths must not contain line breaks"
-done <"${payload_path_list}"
+# Validate precisely the selected payload, using the provisioner's own rules.
+if ! INIT_ENV_FILE="${stage_dir}/init.env" \
+    bash "${stage_dir}/init.sh" --check-config >/dev/null; then
+    die "configuration validation failed: ${config_path}"
+fi
+
 grep -Fxq -- "${RUNNER_DELIMITER}" "${BOOTSTRAP_FILE}" &&
     die "runner delimiter collides with bootstrap content"
 grep -Fxq -- "${PAYLOAD_DELIMITER}" "${BOOTSTRAP_FILE}" &&

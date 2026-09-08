@@ -8,7 +8,6 @@
 # vendor/product IDs receive that narrowly scoped udev rule.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 readonly FSTRIM_USB_RULE_NAME="90-linux-scripts-fstrim-usb.rules"
 
@@ -16,6 +15,7 @@ validateFstrimConfiguration() {
     local declaration
     local device_id
 
+    # shellcheck disable=SC2154
     declaration="$(declare -p CONFIG_FSTRIM_USB_UNMAP_IDS 2>/dev/null)" || {
         printf 'CONFIG_FSTRIM_USB_UNMAP_IDS must be an indexed Bash array\n' >&2
         return 1

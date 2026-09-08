@@ -120,11 +120,11 @@ reload_count="$(grep -cxF systemd-resolved.service "${SYSTEMCTL_LOG}")"
 [[ "${reload_count}" == 1 ]]
 [[ ! -e "${resolv_conf}.bak" ]]
 
-# Reapplying the policy is deterministic and reloads the daemon configuration.
+# Reapplying an already effective policy does not reload the daemon.
 configureSystemdResolved "${drop_in_dir}" "${resolv_conf}" \
     "${runtime_dir}" >/dev/null
 reload_count="$(grep -cxF systemd-resolved.service "${SYSTEMCTL_LOG}")"
-[[ "${reload_count}" == 2 ]]
+[[ "${reload_count}" == 1 ]]
 
 # An effective-property mismatch restores both the drop-in and resolv.conf.
 previous_config="$(<"${target_config}")"
@@ -137,7 +137,7 @@ expect_failure configureSystemdResolved "${drop_in_dir}" "${resolv_conf}" \
 current_link="$(readlink -- "${resolv_conf}")"
 [[ "${current_link}" == "${previous_link}" ]]
 reload_count="$(grep -cxF systemd-resolved.service "${SYSTEMCTL_LOG}")"
-[[ "${reload_count}" == 4 ]]
+[[ "${reload_count}" == 3 ]]
 
 if compgen -G "${resolv_conf%/*}/.linux-scripts-resolved.*" >/dev/null; then
     printf 'resolver transaction directory was not removed\n' >&2

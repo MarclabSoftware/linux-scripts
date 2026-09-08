@@ -6,7 +6,6 @@
 # validates it with dockerd itself and restores the previous file if an active
 # daemon cannot restart with the new policy.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154,SC2310
 
 validateDockerDaemonConfiguration() {
     local prefix prefix_length
@@ -99,6 +98,7 @@ configureDockerDaemon() {
     local transaction_dir candidate backup
     local target_existed=false
     local daemon_active=false
+    local config_changed=true
 
     validateDockerDaemonConfiguration || return
     checkCommand dockerd || return
@@ -132,11 +132,12 @@ configureDockerDaemon() {
             return 1
         }
     fi
+    cmp -s -- "${candidate}" "${target}" && config_changed=false
     systemctl is-active --quiet docker.service && daemon_active=true
 
     if ! installConfigFile "${target}" <"${candidate}" ||
         ! chown root:root "${target}" ||
-        ! { [[ "${daemon_active}" != true ]] ||
+        ! { [[ "${daemon_active}" != true || "${config_changed}" != true ]] ||
             systemctl restart docker.service; } ||
         ! { [[ "${daemon_active}" != true ]] ||
             systemctl is-active --quiet docker.service; }; then

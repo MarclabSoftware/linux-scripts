@@ -112,6 +112,38 @@ done
 [[ ! -e "${extract_dir}/scripts/dns.sh" ]]
 [[ ! -e "${extract_dir}/scripts/ssh_prepare.sh" ]]
 
+# Populate a disposable source tree from the verified public payload, then add
+# private-looking decoys. None may be read or included by the next build.
+decoy_repo="${test_dir}/decoy-repo"
+decoy_artifact="${test_dir}/decoy-artifact.sh"
+mkdir -p -- "${decoy_repo}/src/init"
+cp -a -- "${extract_dir}/." "${decoy_repo}/src/init/"
+cp -- "${REPO_ROOT}/build.sh" "${decoy_repo}/build.sh"
+cp -- "${REPO_ROOT}/src/bootstrap.sh" "${decoy_repo}/src/bootstrap.sh"
+printf 'synthetic private notes\n' >"${decoy_repo}/src/init/private-notes.txt"
+printf 'synthetic stale config\n' >"${decoy_repo}/src/init/init.env.bak"
+printf 'exit 97\n' >"${decoy_repo}/src/init/scripts/unrelated.sh"
+"${decoy_repo}/build.sh" --config "${config_file}" --output "${decoy_artifact}" >/dev/null
+awk -v delimiter="${PAYLOAD_DELIMITER}" -v start_marker="<<'${PAYLOAD_DELIMITER}'" '
+    index($0, start_marker) { copying = 1; next }
+    $0 == delimiter { exit }
+    copying { print }
+' "${decoy_artifact}" >"${test_dir}/decoy.base64"
+base64 --decode "${test_dir}/decoy.base64" >"${test_dir}/decoy.tar.gz"
+tar -tzf "${test_dir}/decoy.tar.gz" >"${test_dir}/decoy.paths"
+if grep -Eq 'private-notes|init\.env\.bak|unrelated\.sh' "${test_dir}/decoy.paths"; then
+    printf 'build incorporated an undeclared source file\n' >&2
+    exit 1
+fi
+# Refuse a symlink before copying or executing its target.
+mv -- "${decoy_repo}/src/init/scripts/utils.sh" "${decoy_repo}/src/init/scripts/utils.sh.saved"
+ln -s unrelated.sh "${decoy_repo}/src/init/scripts/utils.sh"
+if "${decoy_repo}/build.sh" --config "${config_file}" --output "${decoy_artifact}" >"${test_dir}/symlink.output" 2>&1; then
+    printf 'build accepted a linked payload module\n' >&2
+    exit 1
+fi
+grep -Fq 'payload source must be a regular file' "${test_dir}/symlink.output"
+
 # Changing or dropping one Base64 line must fail before init.sh is reached.
 for damage_mode in corrupt truncate; do
     damaged_artifact="${test_dir}/${damage_mode}.sh"

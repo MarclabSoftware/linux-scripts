@@ -8,7 +8,6 @@
 # special files and link metadata are intentionally preserved.
 #
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 validateBackupRestoreConfiguration() {
     local variable value
@@ -74,7 +73,9 @@ restoreBackup() {
 
     validateBackupRestoreConfiguration || return
     checkCommand tar || return
+    # shellcheck disable=SC2154
     archive="${CONFIG_BACKUP_FILE_PATH}"
+    # shellcheck disable=SC2154
     destination="${CONFIG_BACKUP_RESTORE_DESTINATION}"
 
     [[ -d "${destination}" && ! -L "${destination}" ]] || {

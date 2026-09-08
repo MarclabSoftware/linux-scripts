@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: SSH Authorized Keys
-# Version: 3.0.0
-# Updated: 2026-08-09
 # Validates and atomically installs one optional public key for root and the
 # provisioned user. Existing authorized_keys entries are preserved.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154,SC2310
 
 validateSSHPublicKey() {
     local public_key="$1"
@@ -30,6 +27,7 @@ validateSSHKeyConfiguration() {
         return 1
     }
 
+    # shellcheck disable=SC2154
     validateSSHPublicKey "${CONFIG_SSH_KEY_USER:-}" "${CONFIG_USER}" || return
     validateSSHPublicKey "${CONFIG_SSH_KEY_ROOT:-}" root
 }

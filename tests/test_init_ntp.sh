@@ -62,7 +62,7 @@ config_mode=""
 systemctl() {
     printf '%s\n' "$*" >>"${systemctl_log}"
     case "$1" in
-        cat | disable | enable | restart) return 0 ;;
+        cat | disable | enable | restart | start) return 0 ;;
         is-active) [[ "$2" == --quiet ]] ;;
         *) return 2 ;;
     esac
@@ -91,6 +91,12 @@ grep -qxF 'disable chronyd.service' "${systemctl_log}"
 config_mode="$(stat -c '%a' -- "${timesyncd_config}")"
 [[ "${config_mode}" == 644 ]]
 
+# A repeated policy only starts the selected unit (a no-op when active).
+: >"${systemctl_log}"
+customNtp "${timesyncd_root}" >/dev/null
+grep -qxF 'start systemd-timesyncd.service' "${systemctl_log}"
+expect_failure grep -q '^restart ' "${systemctl_log}"
+
 : >"${systemctl_log}"
 CONFIG_NTP_BACKEND="chrony"
 CONFIG_NTP_SERVERS="time.cloudflare.com nts.netnod.se ptbtime4.ptb.de"
@@ -112,6 +118,14 @@ grep -qxF 'disable systemd-timesyncd.service' "${systemctl_log}"
 config_mode="$(stat -c '%a' -- "${chrony_config}")"
 [[ "${config_mode}" == 644 ]]
 grep -qE '^-p -f /tmp/' "${chronyd_log}"
+
+: >"${systemctl_log}"
+customNtp "${chrony_root}" >/dev/null
+grep -qxF 'start chronyd.service' "${systemctl_log}"
+expect_failure grep -q '^restart ' "${systemctl_log}"
+CONFIG_NTP_CHRONY_LOG_CHANGE=1
+customNtp "${chrony_root}" >/dev/null
+grep -qxF 'restart chronyd.service' "${systemctl_log}"
 
 test_package_manager="pacman"
 pacman_config="${TEST_TMP}/chrony-pacman.conf"

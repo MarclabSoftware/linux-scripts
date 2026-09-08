@@ -81,6 +81,21 @@ configureDockerDaemon "${target}" >/dev/null
 grep -Fx '    "log-driver": "local",' "${target}" >/dev/null
 grep -Fx 'restart docker.service' "${SYSTEMCTL_LOG}" >/dev/null
 
+# The same validated policy repairs permissions without restarting Docker.
+: >"${SYSTEMCTL_LOG}"
+chmod 0600 -- "${target}"
+configureDockerDaemon "${target}" >/dev/null
+target_mode="$(stat -c %a -- "${target}")"
+[[ ! -s "${SYSTEMCTL_LOG}" && "${target_mode}" == 644 ]]
+
+# An inactive daemon remains inactive; activation belongs to init's service flags.
+DOCKER_ACTIVE=false
+CONFIG_DOCKER_LOG_DRIVER=json-file
+configureDockerDaemon "${target}" >/dev/null
+[[ ! -s "${SYSTEMCTL_LOG}" ]]
+DOCKER_ACTIVE=true
+CONFIG_DOCKER_LOG_DRIVER=local
+
 # A failed restart restores the file that was present before the attempt.
 printf '{"previous":true}\n' >"${target}"
 SYSTEMCTL_FAIL_NEXT_RESTART=true

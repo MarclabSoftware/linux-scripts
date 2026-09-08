@@ -7,7 +7,6 @@
 # is restored if full-policy validation fails.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 enablePasswordlessSudo() {
     local sudoers_dir="${1:-/etc/sudoers.d}"
@@ -19,6 +18,7 @@ enablePasswordlessSudo() {
         printf 'enablePasswordlessSudo: sudoers directory must be absolute\n' >&2
         return 2
     }
+    # shellcheck disable=SC2154
     isNormalUser "${CONFIG_USER}" || {
         printf 'CONFIG_USER must name an existing non-root user\n' >&2
         return 1

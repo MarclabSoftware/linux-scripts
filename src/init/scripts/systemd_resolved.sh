@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: systemd-resolved
-# Version: 3.0.0
-# Updated: 2026-08-09
 # Installs a validated global resolver policy and selects the matching
 # systemd-managed resolv.conf mode. Per-link DNS routing remains the network
 # manager's responsibility.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154,SC2310
 
 validateSystemdResolvedConfiguration() {
     local variable value
@@ -70,6 +67,7 @@ validateSystemdResolvedConfiguration() {
 }
 
 renderSystemdResolvedConfig() {
+    # shellcheck disable=SC2154
     cat <<EOF
 # Managed by linux-scripts. Local changes will be replaced.
 # Per-link DNS servers and routing domains belong in the network configuration.
@@ -238,6 +236,18 @@ configureSystemdResolved() {
         cleanupSystemdResolvedTransaction "${transaction_dir}" \
             "${resolv_conf_dir}" || true
         return 1
+    fi
+    # Keep effective-policy checks on every run, even when no reload is needed.
+    if cmp -s -- "${candidate}" "${target_config}" &&
+        validateEffectiveSystemdResolved "${resolv_conf}" "${desired_resolv_conf}"; then
+        if ! chmod 0644 -- "${target_config}" ||
+            ! chown root:root "${target_config}"; then
+            cleanupSystemdResolvedTransaction "${transaction_dir}" "${resolv_conf_dir}" || true
+            return 1
+        fi
+        cleanupSystemdResolvedTransaction "${transaction_dir}" "${resolv_conf_dir}" || return
+        printf 'systemd-resolved policy already effective; no reload needed\n'
+        return 0
     fi
     if [[ -e "${target_config}" ]]; then
         config_existed=true

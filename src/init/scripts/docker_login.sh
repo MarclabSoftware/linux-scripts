@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: Docker Login
-# Version: 3.0.0
-# Updated: 2026-08-09
 # Performs an interactive registry login as the configured normal user.
 # Docker Hub's device-code flow can be completed from any browser, so the
 # target host does not need a graphical session. Setting a username instead
 # uses Docker's hidden password or personal-access-token prompt over the
 # current terminal. Secrets are deliberately never accepted through init.env.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 validateDockerLoginConfiguration() {
     local registry="${CONFIG_DOCKER_REGISTRY:-}"
@@ -50,5 +47,6 @@ dockerLogin() {
         printf 'Enter credentials in this terminal when prompted.\n'
     fi
 
+    # shellcheck disable=SC2154
     sudo -H -u "${CONFIG_USER}" -- "${login_command[@]}"
 }

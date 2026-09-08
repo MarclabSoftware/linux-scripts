@@ -8,7 +8,6 @@
 # packages are not left behind. Package-manager configuration conflicts stop
 # provisioning before any host configuration is changed.
 #
-# shellcheck disable=SC2154
 
 detect_package_manager() (
     local ID=""
@@ -147,6 +146,7 @@ update_arch_system() {
 
     if yay_path="$(command -v yay 2>/dev/null)"; then
         printf '\nUpdating installed AUR packages with Yay\n'
+        # shellcheck disable=SC2154
         sudo -H -u "${CONFIG_USER}" -- "${yay_path}" -Syu --aur
     fi
 
@@ -334,6 +334,7 @@ check_debian_package_state() {
 }
 
 selected_package_manager() {
+    # shellcheck disable=SC2154
     local package_manager="${CONFIG_PACKAGE_MANAGER}"
 
     if [[ "${package_manager}" == auto ]]; then

@@ -9,14 +9,19 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPO_ROOT
 readonly INIT_SCRIPT="${REPO_ROOT}/src/init/init.sh"
 
+# Require noninteractive elevation before creating root-owned fixtures or traps.
+root_command=()
+if ((EUID != 0)); then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+        printf 'init phase tests skipped: root or passwordless sudo is unavailable\n'
+        exit 77
+    fi
+    root_command=(sudo -n)
+fi
+
 TEST_TMP="$(mktemp -d)"
 readonly TEST_TMP
-trap 'sudo rm -rf -- "${TEST_TMP}"' EXIT
-
-if ((EUID != 0)) && ! sudo -n true >/dev/null 2>&1; then
-    printf 'init phase tests skipped: passwordless sudo is unavailable\n'
-    exit 0
-fi
+trap '"${root_command[@]}" rm -rf -- "${TEST_TMP}"' EXIT
 
 fake_bin="${TEST_TMP}/bin"
 config_file="${TEST_TMP}/init.env"
@@ -83,8 +88,19 @@ dpkg_file="${fake_bin}/dpkg"
 } >"${dpkg_file}"
 chmod 0755 -- "${dpkg_file}"
 
+# Simulate only Yay's privilege switch. The package command is already a fake;
+# exercising the real sudo policy is outside this phase-state test.
+sudo_file="${fake_bin}/sudo"
+cat >"${sudo_file}" <<'SUDO'
+#!/usr/bin/env bash
+[[ "$1" == -H && "$2" == -u && "$3" == nobody && "$4" == -- ]] || exit 2
+shift 4
+exec "$@"
+SUDO
+chmod 0755 -- "${sudo_file}"
+
 run_init() {
-    sudo env \
+    "${root_command[@]}" env \
         PATH="${fake_bin}:${PATH}" \
         INIT_BOOT_ID_FILE="${boot_id_file}" \
         INIT_LOCK_FILE="${lock_file}" \
@@ -100,8 +116,8 @@ boot_two="22222222-2222-4222-8222-222222222222"
 # Preflight validates prerequisites without touching phase state or packages.
 run_init --preflight |
     grep -Fx 'init preflight passed for nobody using pacman' >/dev/null
-sudo test ! -e "${state_file}"
-sudo test ! -e "${lock_file}"
+"${root_command[@]}" test ! -e "${state_file}"
+"${root_command[@]}" test ! -e "${lock_file}"
 [[ ! -s "${call_log}" ]]
 
 # Identity creation belongs to the OS installer; preflight must reject a
@@ -111,7 +127,7 @@ cp -- "${config_file}" "${missing_user_config}"
 sed -i 's/^CONFIG_USER=.*/CONFIG_USER="linux-scripts-user-that-does-not-exist"/' \
     "${missing_user_config}"
 set +e
-sudo env \
+"${root_command[@]}" env \
     PATH="${fake_bin}:${PATH}" \
     INIT_BOOT_ID_FILE="${boot_id_file}" \
     INIT_LOCK_FILE="${lock_file}" \
@@ -129,8 +145,8 @@ fi
 printf '%s\n' "${boot_one}" >"${boot_id_file}"
 
 run_init >/dev/null
-sudo test -f "${state_file}"
-sudo grep -Fx "${boot_one}" "${state_file}" >/dev/null
+"${root_command[@]}" test -f "${state_file}"
+"${root_command[@]}" grep -Fx "${boot_one}" "${state_file}" >/dev/null
 grep -Fx 'pacman -Syu --needed sudo pacman-contrib git htop' \
     "${call_log}" >/dev/null
 grep -Fx 'yay -Syu --aur' "${call_log}" >/dev/null
@@ -154,7 +170,7 @@ fi
 # A different boot ID unlocks phase two and successful completion clears state.
 printf '%s\n' "${boot_two}" >"${boot_id_file}"
 run_init >/dev/null
-sudo test ! -e "${state_file}"
+"${root_command[@]}" test ! -e "${state_file}"
 [[ ! -s "${call_log}" ]]
 
 # Unresolved Pacman configuration files must stop before state is recorded.
@@ -166,7 +182,7 @@ if ((run_status == 0)); then
     printf 'init accepted an unresolved pacnew file\n' >&2
     exit 1
 fi
-sudo test ! -e "${state_file}"
+"${root_command[@]}" test ! -e "${state_file}"
 
 # Exercise the APT update/audit path as well.
 : >"${call_log}"
@@ -180,10 +196,10 @@ grep -Fx 'apt-get --yes autoremove' "${call_log}" >/dev/null
 grep -Fx 'apt-get clean' "${call_log}" >/dev/null
 grep -Fx 'apt-get check' "${call_log}" >/dev/null
 grep -Fx 'dpkg --audit' "${call_log}" >/dev/null
-sudo test -f "${state_file}"
+"${root_command[@]}" test -f "${state_file}"
 
 printf '%s\n' "${boot_one}" >"${boot_id_file}"
 run_init >/dev/null
-sudo test ! -e "${state_file}"
+"${root_command[@]}" test ! -e "${state_file}"
 
 printf 'init phase tests passed\n'

@@ -78,10 +78,10 @@ installConfigFile() {
         return 1
     }
     if [[ ! -d "${target_dir}" ]]; then
-        install -d -m 0755 -- "${target_dir}"
+        install -d -m 0755 -- "${target_dir}" || return
     fi
 
-    temporary="$(mktemp -- "${target_dir}/.${target##*/}.XXXXXX")"
+    temporary="$(mktemp -- "${target_dir}/.${target##*/}.XXXXXX")" || return
     if ! cat >"${temporary}" || ! chmod 0644 -- "${temporary}"; then
         rm -f -- "${temporary}"
         return 1
@@ -133,11 +133,11 @@ enableService() {
 
     case "${start_service}" in
         true)
-            systemctl enable --now "${service_name}"
+            systemctl enable --now "${service_name}" || return
             printf '%s enabled and started\n' "${service_name}"
             ;;
         false)
-            systemctl enable "${service_name}"
+            systemctl enable "${service_name}" || return
             printf '%s enabled\n' "${service_name}"
             ;;
         *)

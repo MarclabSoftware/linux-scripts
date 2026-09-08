@@ -7,7 +7,6 @@
 # firmware options without embedding board-specific assumptions in this repo.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 readonly RPI_MANAGED_BOOT_FRAGMENT="linux-scripts.txt"
 
@@ -15,6 +14,7 @@ validateRpiBootConfiguration() {
     local declaration
     local line
 
+    # shellcheck disable=SC2154
     declaration="$(declare -p CONFIG_RPI_BOOT_SETTINGS 2>/dev/null)" || {
         printf 'CONFIG_RPI_BOOT_SETTINGS must be an indexed Bash array\n' >&2
         return 1

@@ -241,14 +241,14 @@ first_rsa_key="$(<"${HOST_KEY_DIR}/ssh_host_rsa_key")"
 hardenSSH "${main_config}" "${drop_in_dir}" "${HOST_KEY_DIR}" >/dev/null
 [[ "$(<"${HOST_KEY_DIR}/ssh_host_rsa_key")" == "${first_rsa_key}" ]]
 reload_count="$(grep -cxF sshd.service "${SYSTEMCTL_LOG}")"
-[[ "${reload_count}" == 2 ]]
+[[ "${reload_count}" == 1 ]]
 
 # The explicit force flag remains available for an intentional later rotation.
 CONFIG_SSH_FORCE_HOST_KEY_ROTATION=true
 hardenSSH "${main_config}" "${drop_in_dir}" "${HOST_KEY_DIR}" >/dev/null
 [[ "$(<"${HOST_KEY_DIR}/ssh_host_rsa_key")" != "${first_rsa_key}" ]]
 reload_count="$(grep -cxF sshd.service "${SYSTEMCTL_LOG}")"
-[[ "${reload_count}" == 3 ]]
+[[ "${reload_count}" == 2 ]]
 
 # A failed effective-policy check restores both the drop-in and host keys.
 previous_config="$(<"${target_config}")"
@@ -259,6 +259,61 @@ expect_failure hardenSSH "${main_config}" "${drop_in_dir}" "${HOST_KEY_DIR}"
 [[ "$(<"${target_config}")" == "${previous_config}" ]]
 [[ "$(<"${HOST_KEY_DIR}/ssh_host_rsa_key")" == "${previous_rsa_key}" ]]
 reload_count="$(grep -cxF sshd.service "${SYSTEMCTL_LOG}")"
-[[ "${reload_count}" == 3 ]]
+[[ "${reload_count}" == 2 ]]
+
+# A rejected inventory must leave even the earlier key types untouched.
+recovery_home="${TEST_TMP}/recovery-keys"
+recovery_backup="${TEST_TMP}/recovery-backup"
+mkdir -- "${recovery_home}" "${recovery_backup}"
+for key_name in rsa ecdsa ed25519; do
+    printf 'original %s\n' "${key_name}" >"${recovery_home}/ssh_host_${key_name}_key"
+done
+command mv -- "${recovery_home}/ssh_host_ecdsa_key" "${TEST_TMP}/ecdsa-original"
+ln -s -- "${TEST_TMP}/ecdsa-original" "${recovery_home}/ssh_host_ecdsa_key"
+expect_failure backupSSHHostKeys "${recovery_home}" "${recovery_backup}"
+[[ -f "${recovery_home}/ssh_host_rsa_key" ]]
+restoreSSHHostKeys "${recovery_home}" "${recovery_backup}"
+[[ -L "${recovery_home}/ssh_host_ecdsa_key" ]]
+grep -qxF 'original ed25519' "${recovery_home}/ssh_host_ed25519_key"
+rm -- "${recovery_home}/ssh_host_ecdsa_key"
+command mv -- "${TEST_TMP}/ecdsa-original" "${recovery_home}/ssh_host_ecdsa_key"
+
+# Simulate a write failure after RSA has already moved into the backup.
+FAIL_HOST_KEY_MOVE=true
+mv() {
+    if [[ "${FAIL_HOST_KEY_MOVE}" == true &&
+        "${2:-}" == "${recovery_home}/ssh_host_ecdsa_key" ]]; then
+        return 41
+    fi
+    command mv "$@"
+}
+expect_failure backupSSHHostKeys "${recovery_home}" "${recovery_backup}"
+FAIL_HOST_KEY_MOVE=false
+restoreSSHHostKeys "${recovery_home}" "${recovery_backup}"
+for key_name in rsa ecdsa ed25519; do
+    grep -qxF "original ${key_name}" "${recovery_home}/ssh_host_${key_name}_key"
+done
+rm -rf -- "${recovery_backup}"
+mkdir -- "${recovery_backup}"
+
+# A failed rollback remains retryable: never consume its only backup copies.
+backupSSHHostKeys "${recovery_home}" "${recovery_backup}"
+printf 'new identity\n' >"${recovery_home}/ssh_host_mldsa44_ed25519_key"
+FAIL_HOST_KEY_RESTORE=true
+cp() {
+    if [[ "${FAIL_HOST_KEY_RESTORE}" == true &&
+        "${*: -1}" == "${recovery_home}/ssh_host_ecdsa_key" ]]; then
+        return 42
+    fi
+    command cp "$@"
+}
+expect_failure restoreSSHHostKeys "${recovery_home}" "${recovery_backup}"
+FAIL_HOST_KEY_RESTORE=false
+restoreSSHHostKeys "${recovery_home}" "${recovery_backup}"
+for key_name in rsa ecdsa ed25519; do
+    grep -qxF "original ${key_name}" "${recovery_home}/ssh_host_${key_name}_key"
+done
+[[ ! -e "${recovery_home}/ssh_host_mldsa44_ed25519_key" ]]
+[[ -f "${recovery_backup}/ssh_host_rsa_key" ]]
 
 printf 'init SSH tests passed\n'

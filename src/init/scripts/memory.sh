@@ -6,7 +6,6 @@
 # writeback policy. This module only configures the two swap-policy knobs whose
 # useful values depend on the backing device, plus native zram-generator.
 #
-# shellcheck disable=SC2154
 
 validateMemoryConfiguration() {
     local compression="${CONFIG_MEMORY_ZRAM_COMPRESSION_ALGORITHM:-}"

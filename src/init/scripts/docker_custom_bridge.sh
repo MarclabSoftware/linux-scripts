@@ -7,7 +7,6 @@
 # administrator intervention and are never deleted automatically.
 #
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 validateCustomDockerBridgeConfiguration() {
     [[ -v CONFIG_DOCKER_NETWORK_CUSTOM_BRIDGE_NAME ]] || {

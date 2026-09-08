@@ -6,7 +6,6 @@
 # phase-one update. Pacman hosts also clear Yay's per-user AUR build cache when
 # Yay is installed. Configuration and shared helpers are injected by init.sh.
 #
-# shellcheck disable=SC2154,SC2310
 
 cleanup_pacman_packages() {
     local -a orphaned_packages=()
@@ -26,6 +25,7 @@ cleanup_pacman_packages() {
 
     if yay_path="$(command -v yay 2>/dev/null)"; then
         checkCommand sudo
+        # shellcheck disable=SC2154
         printf '\nEmptying the Yay AUR build cache for %s\n' "${CONFIG_USER}"
         sudo -H -u "${CONFIG_USER}" -- \
             "${yay_path}" -Sc --aur --noconfirm

@@ -7,7 +7,6 @@
 # the board's existing EEPROM configuration such as BOOT_ORDER.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 validateRpiEepromConfiguration() {
     case "${CONFIG_RPI_EEPROM_RELEASE:-}" in

@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: GNU nano
-# Version: 3.0.0
-# Updated: 2026-08-09
 # Adds syntax definitions and line numbers to the normal user's and root's
 # .nanorc files without replacing their other editor preferences.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154
 
 configureNanoFile() {
     if (($# != 3)); then
@@ -88,6 +85,7 @@ configureNano() {
     local root_home="${2:-${HOME_ROOT_D}}"
     local user_group
 
+    # shellcheck disable=SC2154
     isNormalUser "${CONFIG_USER}" || {
         printf 'CONFIG_USER must name an existing non-root user\n' >&2
         return 1

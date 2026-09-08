@@ -8,7 +8,6 @@
 # parameters.
 #
 # Configuration and shared helpers are provided by init.sh.
-# shellcheck disable=SC2154
 
 validateNetworkConfiguration() {
     local setting
@@ -122,7 +121,9 @@ configureNetwork() {
         ensureCongestionControlAvailable "${congestion_control}"
     fi
 
+    # shellcheck disable=SC2154
     [[ "${CONFIG_NETWORK_IPV4_FORWARDING}" == true ]] && ipv4_forwarding=1
+    # shellcheck disable=SC2154
     [[ "${CONFIG_NETWORK_IPV6_FORWARDING}" == true ]] && ipv6_forwarding=1
     if [[ -n "${reserved_port_spec}" ]]; then
         configuration+=(

@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 
 # Provisioning Module: SSH Known Hosts
-# Version: 3.0.0
-# Updated: 2026-08-09
 # Adds administrator-verified entries to the system-wide known_hosts file.
 # Per-user trust databases remain untouched.
 # Configuration and helpers are injected by init.sh.
-# shellcheck disable=SC2154,SC2310
 
 validateSSHKnownHostsConfiguration() {
     local source_file
 
     checkConfig "CONFIG_SSH_KNOWN_HOSTS_FILE" || return 1
+    # shellcheck disable=SC2154
     source_file="${CONFIG_SSH_KNOWN_HOSTS_FILE}"
     [[ "${source_file}" == /* && -r "${source_file}" ]] || {
         printf '%s\n' \

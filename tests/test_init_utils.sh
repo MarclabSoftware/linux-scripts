@@ -56,4 +56,13 @@ grep -Fx 'enable example.service' "${service_log}" >/dev/null
 grep -Fx 'enable --now example.service' "${service_log}" >/dev/null
 expect_failure enableService example.service invalid
 
+# Failures must propagate even when the caller uses the helper in an if/! test.
+printf '%s\n' '#!/bin/sh' 'exit 42' >"${systemctl_file}"
+PATH="${fake_bin}:${PATH}" expect_failure enableService example.service true
+PATH="${fake_bin}:${PATH}" expect_failure enableService example.service false
+printf '%s\n' '#!/bin/sh' 'exit 42' >"${fake_bin}/mktemp"
+chmod 0755 -- "${fake_bin}/mktemp"
+PATH="${fake_bin}:${PATH}" expect_failure installConfigFile "${TEST_TMP}/config" <<<content
+[[ ! -e "${TEST_TMP}/config" ]]
+
 printf 'init utility tests passed\n'
