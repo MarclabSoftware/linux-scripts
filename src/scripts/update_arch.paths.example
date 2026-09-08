@@ -1,4 +1,6 @@
-# One absolute path per line. tar reads this file literally; shell globs are not expanded.
+# One absolute path per line; blank lines and lines starting with # are ignored.
+# All paths are required. Prefix an optional path with ? (for example ?/opt/tool).
+# Shell globs are not expanded. Read errors still fail the entire backup.
 /etc/pacman.conf
 /etc/ssh
 /etc/systemd

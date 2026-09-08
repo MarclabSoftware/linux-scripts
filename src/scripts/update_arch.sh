@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Arch Linux System Maintenance
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Updates Arch packages and optionally creates a configuration archive,
 # refreshes pacman-mirrors, updates Raspberry Pi EEPROM firmware, vacuums the
@@ -51,26 +49,51 @@ validate_boolean() {
     [[ "${value}" == "0" || "${value}" == "1" ]] || die "${name} must be 0 or 1"
 }
 
-create_backup() {
-    local timestamp
-    local backup_file
+create_backup() (
+    # Keep cleanup local to this backup, including failures before package updates.
+    local timestamp partial backup_file path optional
+    local -a paths=()
+    [[ "${BACKUP_ENABLED}" == 1 ]] || return 0
+    require_command tar
+    [[ -f "${BACKUP_PATHS_FILE}" && -r "${BACKUP_PATHS_FILE}" ]] ||
+        die "backup paths file is not readable: ${BACKUP_PATHS_FILE}"
 
-    [[ "${BACKUP_ENABLED}" == "1" ]] || return 0
-    [[ -r "${BACKUP_PATHS_FILE}" ]] || die "backup paths file is not readable: ${BACKUP_PATHS_FILE}"
-    mkdir -p -- "${BACKUP_DIR}"
-    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    backup_file="${BACKUP_DIR}/arch-config-${timestamp}.tar.gz"
+    while IFS= read -r path || [[ -n "${path}" ]]; do
+        path="${path%$'\r'}"
+        case "${path}" in
+            '' | \#*) continue ;;
+            *) ;;
+        esac
+        optional=false
+        if [[ "${path}" == \?* ]]; then
+            optional=true
+            path="${path:1}"
+        fi
+        [[ "${path}" == /* ]] || die "backup paths must be absolute: ${path}"
+        if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+            [[ "${optional}" == true ]] || die "required backup path is missing: ${path}"
+            log INFO "Optional backup path is absent: ${path}"
+            continue
+        fi
+        paths+=("${path}")
+    done <"${BACKUP_PATHS_FILE}"
+    ((${#paths[@]} > 0)) || die "no existing backup paths were selected"
 
+    mkdir -p -- "${BACKUP_DIR}" || die "cannot create backup directory"
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)" || return
+    partial="$(mktemp -- "${BACKUP_DIR}/arch-config-${timestamp}.XXXXXX.part")" || return
+    trap 'rm -f -- "${partial}"' EXIT
+    backup_file="${partial%.part}.tar.gz"
     log INFO "Creating configuration backup: ${backup_file}"
-    tar \
-        --create \
-        --gzip \
-        --file "${backup_file}" \
-        --ignore-failed-read \
-        --warning=no-file-changed \
-        --files-from "${BACKUP_PATHS_FILE}"
-    chmod 0600 -- "${backup_file}"
-}
+    # Every selected path must be readable in full. An incomplete archive never
+    # receives the final name and cannot authorize a package upgrade.
+    TAR_OPTIONS="" GZIP="" tar --create --gzip --file "${partial}" -- "${paths[@]}" ||
+        die "configuration backup failed; package updates were not started"
+    chmod 0600 -- "${partial}" || return
+    mv -nT -- "${partial}" "${backup_file}" || return
+    [[ ! -e "${partial}" ]] || die "backup destination already exists: ${backup_file}"
+    log INFO "Configuration backup completed (${#paths[@]} selected paths)."
+)
 
 refresh_mirrors() {
     [[ -n "${MIRROR_COUNTRIES}" ]] || return 0
@@ -171,7 +194,6 @@ fi
 ((EUID == 0)) || die "run this script as root"
 require_command flock
 require_command pacman
-require_command tar
 
 exec 9>"${LOCK_FILE}"
 flock -n 9 || die "another Arch maintenance process is already running"
