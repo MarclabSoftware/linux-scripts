@@ -12,17 +12,9 @@ ConditionPathExists=/run/%i/%i.ctl
 Type=oneshot
 UMask=0022
 
-# Download into the destination directory, validate the basic root-zone
-# structure, publish atomically, then ask Unbound to reload its configuration.
-ExecStartPre=/usr/bin/rm -f /etc/%i/.root.hints.new
-ExecStart=/usr/bin/curl --fail --silent --show-error --location --proto =https --tlsv1.2 --output /etc/%i/.root.hints.new https://www.internic.net/domain/named.cache
-ExecStart=/usr/bin/test -s /etc/%i/.root.hints.new
-ExecStart=/usr/bin/grep -Eq "^[.][[:space:]]+[0-9]+[[:space:]]+(IN[[:space:]]+)?NS[[:space:]]+" /etc/%i/.root.hints.new
-ExecStart=/usr/bin/chmod 0644 /etc/%i/.root.hints.new
-ExecStart=/usr/bin/mv -f /etc/%i/.root.hints.new /etc/%i/root.hints
-ExecStart=/usr/bin/unbound-checkconf /etc/%i/unbound.conf
-ExecStart=/usr/bin/unbound-control -s /run/%i/%i.ctl reload
-ExecStopPost=-/usr/bin/rm -f /etc/%i/.root.hints.new
+# Install src/scripts/unbound_update_root_hints.sh at this path with mode 0755.
+# The helper retains the previous hints until configuration and reload succeed.
+ExecStart=/usr/local/libexec/linux-scripts/unbound_update_root_hints.sh /etc/%i/root.hints /etc/%i/unbound.conf /run/%i/%i.ctl
 TimeoutStartSec=2min
 
 CapabilityBoundingSet=CAP_DAC_OVERRIDE
