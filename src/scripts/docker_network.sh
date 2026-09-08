@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Docker Bridge Network Provisioner
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Idempotently creates one Docker network. Host-specific IPAM settings may be
 # supplied through docker_network.env beside this script or through the process
@@ -78,12 +76,43 @@ esac
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 
-if docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-    existing_driver="$(docker network inspect --format '{{.Driver}}' "${NETWORK_NAME}")"
+network_format='{{.Driver}}{{println}}{{.EnableIPv6}}{{range .IPAM.Config}}{{println}}{{.Subnet}}|{{.Gateway}}{{end}}'
+if network_snapshot="$(docker network inspect --format "${network_format}" "${NETWORK_NAME}" 2>/dev/null)"; then
+    mapfile -t network_info <<<"${network_snapshot}"
+    ((${#network_info[@]} >= 2)) || die "Docker returned incomplete network details"
+    existing_driver="${network_info[0]}"
     [[ "${existing_driver}" == "${NETWORK_DRIVER}" ]] ||
         die "existing network ${NETWORK_NAME} uses driver ${existing_driver}, expected ${NETWORK_DRIVER}"
+    if [[ -n "${DOCKER_NETWORK_ENABLE_IPV6+x}" ]]; then
+        expected_ipv6=false
+        [[ "${ENABLE_IPV6}" != 1 ]] || expected_ipv6=true
+        [[ "${network_info[1]}" == "${expected_ipv6}" ]] ||
+            die "existing network ${NETWORK_NAME} has IPv6=${network_info[1]}, expected ${expected_ipv6}"
+    fi
+    ipv4_matches=false
+    ipv6_matches=false
+    for pool in "${network_info[@]:2}"; do
+        IFS='|' read -r subnet gateway <<<"${pool}"
+        if [[ "${subnet}" == "${IPV4_SUBNET}" && (-z "${IPV4_GATEWAY}" || "${gateway}" == "${IPV4_GATEWAY}") ]]; then
+            ipv4_matches=true
+        fi
+        if [[ "${subnet}" == "${IPV6_SUBNET}" && (-z "${IPV6_GATEWAY}" || "${gateway}" == "${IPV6_GATEWAY}") ]]; then
+            ipv6_matches=true
+        fi
+    done
+    [[ -z "${IPV4_SUBNET}" || "${ipv4_matches}" == true ]] ||
+        die "existing network ${NETWORK_NAME} does not match the requested IPv4 subnet/gateway"
+    [[ -z "${IPV6_SUBNET}" || "${ipv6_matches}" == true ]] ||
+        die "existing network ${NETWORK_NAME} does not match the requested IPv6 subnet/gateway"
     exit 0
 fi
+
+# A failed inspect is not evidence that a network is absent (the daemon may be
+# unavailable). Confirm absence before attempting creation.
+network_names="$(docker network ls --format '{{.Name}}')" || die "cannot list Docker networks"
+while IFS= read -r existing_name; do
+    [[ "${existing_name}" != "${NETWORK_NAME}" ]] || die "cannot inspect existing network ${NETWORK_NAME}"
+done <<<"${network_names}"
 
 create_args=(--driver "${NETWORK_DRIVER}")
 if [[ -n "${IPV4_SUBNET}" ]]; then
