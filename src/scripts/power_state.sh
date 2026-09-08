@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 
 # MQTT Power-State Publisher
-# Version: 1.0.0
-# Updated: 2026-07-29
 #
 # Publishes a Linux power-supply state through mosquitto_pub. Broker credentials
 # and connection options stay in a private mosquitto_pub options file, while
 # host-specific paths are supplied by power_state.env beside this script.
 
 set -Eeuo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+    cat <<'HELP'
+Usage: power_state.sh [--check-config]
+Configuration: power_state.env or POWER_STATE_ENV_FILE.
+Publishes the configured sysfs state using the private Mosquitto options file.
+HELP
+    exit 0
+fi
 IFS=$'\n\t'
 umask 077
 
@@ -52,10 +59,6 @@ done
 case "${1:-}" in
     --check-config)
         printf 'power_state configuration is valid\n'
-        exit 0
-        ;;
-    --help | -h)
-        printf 'Usage: power_state.sh [--check-config]\n'
         exit 0
         ;;
     "") ;;

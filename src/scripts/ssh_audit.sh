@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 
 # SSH Security Audit
-# Version: 2.1.0
-# Updated: 2026-08-15
 #
 # Keeps a shallow ssh-audit checkout in the user cache and audits either the
 # arguments supplied by the caller or the local SSH daemon. When run inside an
 # SSH session, the local daemon port is inferred from SSH_CONNECTION.
 
 set -Eeuo pipefail
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && ("${1:-}" == --help || "${1:-}" == -h) ]]; then
+    cat <<'HELP'
+Usage: ./ssh_audit.sh [SSH-AUDIT OPTIONS ...]
+Without arguments, audit localhost using SSH_AUDIT_PORT, the SSH session port,
+or port 22. Runs as a normal user; requires Git and Python 3.
+Each audit updates the upstream checkout in SSH_AUDIT_TOOL_DIR (default: user
+cache). This wrapper help performs no download. Other options go to ssh-audit.
+HELP
+    exit 0
+fi
 umask 077
 
 readonly GIT_URL="https://github.com/jtesta/ssh-audit.git"
@@ -19,7 +28,6 @@ trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
 trap 'rm -f -- "${audit_stderr}"' EXIT
 
 # The ERR trap invokes this function indirectly.
-# shellcheck disable=SC2317,SC2329
 error_handler() {
     local exit_code=$1
     local line_number=$2

@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 
 # USB Device Scanner
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Lists device nodes and stable serial identifiers for attached USB devices.
 # Device metadata is queried concurrently because udevadm calls are independent.
 
 set -euo pipefail
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && ("${1:-}" == --help || "${1:-}" == -h) ]]; then
+    cat <<'HELP'
+Usage: ./devices.sh
+List attached USB device nodes and their stable serial identifiers.
+Reads sysfs and udev metadata; no root privileges or configuration are required.
+Dependencies: udevadm, find, xargs and GNU coreutils.
+HELP
+    exit 0
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]] && (($# != 0)); then
+    printf '%s\n' 'Unexpected arguments; see --help' >&2
+    exit 2
+fi
 
 # Function to process each device
 process_device() {

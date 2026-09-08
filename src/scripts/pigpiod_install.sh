@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Arch Linux pigpio Installer
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Builds the pigpio AUR package as an unprivileged user and installs a systemd
 # drop-in for the pigpiod sampling interval. Valid pigpiod sample rates are

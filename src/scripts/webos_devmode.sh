@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 
 # LG webOS Developer Mode Session Renewer
-# Version: 2.1.0
-# Updated: 2026-08-15
 #
 # Reads the current Developer Mode token over SSH and submits it to LG's renewal
 # endpoint. A cached token is used only when the TV is temporarily unavailable.
 # Secrets remain in a private SSH key and an ignored sidecar environment file.
 
 set -Eeuo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+    cat <<'HELP'
+Usage: webos_devmode.sh [--check-config]
+Configuration: webos_devmode.env or WEBOS_ENV_FILE.
+Renews the session over SSH/HTTPS; exit 75 defers retry when the TV is unavailable.
+HELP
+    exit 0
+fi
 IFS=$'\n\t'
 umask 077
 
@@ -76,10 +83,6 @@ case "${1:-}" in
     --check-config)
         [[ -r "${PRIVATE_KEY}" ]] || die "private key is not readable: ${PRIVATE_KEY}"
         printf 'webos_devmode configuration is valid\n'
-        exit 0
-        ;;
-    --help | -h)
-        printf 'Usage: webos_devmode.sh [--check-config]\n'
         exit 0
         ;;
     "") ;;

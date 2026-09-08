@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # NPM/NPMplus Certificate Monitor
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Monitors a certificate managed by Nginx Proxy Manager (NPM) or NPMplus and
 # publishes it as a PKCS#12/PFX file. Both products expose a certificate

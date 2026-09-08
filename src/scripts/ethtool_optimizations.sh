@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Ethernet Offload Optimizer
-# Version: 1.0.0
-# Updated: 2026-07-29
 #
 # Applies configured ethtool feature states to matching network interfaces.
 # Interface patterns and feature choices are loaded from an optional sidecar;
@@ -105,7 +103,6 @@ shopt -s nullglob
 for pattern in "${patterns[@]}"; do
     # Patterns are validated above and expansion is intentionally limited to
     # the configured sysfs network directory.
-    # shellcheck disable=SC2086
     for interface_path in "${SYSFS_NET_DIR}"/${pattern}; do
         interface_name="${interface_path##*/}"
         [[ "${interface_name}" != "lo" && -z "${processed[${interface_name}]:-}" ]] ||

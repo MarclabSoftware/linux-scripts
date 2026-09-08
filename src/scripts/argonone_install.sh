@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Arch Linux Argon One Driver Installer
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Builds and installs the argonone-c-git AUR package as an unprivileged user.
 # The source checkout is kept in the user's cache so subsequent runs only need

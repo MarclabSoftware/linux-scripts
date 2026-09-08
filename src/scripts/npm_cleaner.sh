@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Certbot Certificate Archive Cleaner
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Removes expired Certbot CSR/key files and archive versions older than the
 # versions referenced by each live certificate. The script supports Certbot's
@@ -10,6 +8,15 @@
 # Manager. Deletion is disabled by default.
 
 set -Eeuo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+    cat <<'HELP'
+Usage: npm_cleaner.sh [--check-config]
+Configuration: npm_cleaner.env or NPM_CLEANER_ENV_FILE.
+Dry run is the default (NPM_CLEANER_DRY_RUN=1); set 0 to delete old files.
+HELP
+    exit 0
+fi
 IFS=$'\n\t'
 umask 077
 
@@ -154,10 +161,6 @@ case "${1:-}" in
         [[ -d "${LETSENCRYPT_DIR}" ]] ||
             die "Let's Encrypt directory does not exist: ${LETSENCRYPT_DIR}"
         printf 'npm_cleaner configuration is valid\n'
-        exit 0
-        ;;
-    --help | -h)
-        printf 'Usage: npm_cleaner.sh [--check-config]\n'
         exit 0
         ;;
     "") ;;
