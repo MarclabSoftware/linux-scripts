@@ -1,0 +1,18 @@
+# Copy to /etc/wireguard/wg0-nat.nft, set the uplink, and chmod 0600.
+# wg-quick [Interface] hooks (no keys or peer changes are needed):
+# PostUp = nft -f /etc/wireguard/wg0-nat.nft
+# PostDown = nft destroy table inet wg0_nat
+# Requires nftables with the idempotent `destroy` command.
+define vpn_if = "wg0"
+define uplink = "eth0"
+
+# Idempotent, atomic update of this VPN's NAT only. Never flush the ruleset.
+add table inet wg0_nat
+flush table inet wg0_nat
+table inet wg0_nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat - 1; policy accept;
+        iifname $vpn_if oifname $uplink meta nfproto ipv4 counter masquerade
+        iifname $vpn_if oifname $uplink ip6 saddr fc00::/7 counter masquerade
+    }
+}

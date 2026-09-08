@@ -2,9 +2,10 @@
 Description=Update GeoIP firewall rules
 # Instance: Linux account that owns /home/<instance>/scripts.
 # Example: ip_blocker@service-user.service
-Requires=docker.service
-Wants=network-online.target
-After=network-online.target docker.service
+# Downloads have bounded attempts and validated caches; retry when unavailable.
+# Missing Docker/flowtable interfaces do not prevent the base filter from loading.
+After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -14,9 +15,11 @@ Group=root
 # The instance name selects the account whose scripts directory is used.
 ExecStart=/home/%i/scripts/ip_blocker.sh
 TimeoutStartSec=15min
+Restart=on-failure
+RestartSec=60s
 
 # Firewall administration requires root and a narrow capability set.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -29,6 +32,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 # At early boot, the local DNS resolver (Technitium/systemd-resolved) may not
 # be ready. DNS_SERVERS tells both scripts to resolve
-# hostnames via these public DNS servers (dig/drill/host), bypassing the system
-# resolver entirely for curl downloads.
+# hostnames with dig via these public DNS servers. Curl uses the system resolver
+# if the override produces no addresses.
 #Environment=DNS_SERVERS="8.8.8.8 1.1.1.1"
