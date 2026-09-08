@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Vaultwarden Backup Sender
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Creates a transactionally consistent Vaultwarden snapshot and streams it to
 # a restricted SSH receiver. Deployment-specific paths and SSH settings belong

@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Vaultwarden Restore Utility
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Verifies and restores a selected snapshot with an atomic directory swap and
 # automatic rollback when container startup or health verification fails.
@@ -63,7 +61,7 @@ load_environment
 readonly BACKUP_ROOT="${VAULTWARDEN_BACKUP_ROOT}"
 readonly SNAPSHOTS_DIR="${BACKUP_ROOT}/snapshots"
 readonly STACK_DIR="${VAULTWARDEN_STACK_DIR}"
-readonly DATA_DIR="${VAULTWARDEN_DATA_DIR:-${STACK_DIR}/mnt/data}"
+DATA_DIR="${VAULTWARDEN_DATA_DIR:-${STACK_DIR}/mnt/data}"
 readonly COMPOSE_FILE="${VAULTWARDEN_COMPOSE_FILE:-${STACK_DIR}/compose.yaml}"
 readonly SERVICE_NAME="${VAULTWARDEN_SERVICE_NAME:-vaultwarden}"
 readonly HEALTH_TIMEOUT_SECONDS="${VAULTWARDEN_HEALTH_TIMEOUT_SECONDS:-60}"
@@ -80,9 +78,22 @@ if [[ "${1:-}" == "--check-config" ]]; then
     exit 0
 fi
 
-for command_name in docker flock sha256sum sqlite3 stat; do
+for command_name in flock realpath sha256sum sqlite3 stat; do
     require_command "${command_name}"
 done
+
+DATA_DIR="$(realpath -m -- "${DATA_DIR}")"
+readonly DATA_DIR
+[[ "${DATA_DIR}" != / ]] || die "the filesystem root cannot be a data directory"
+[[ ! -e "${DATA_DIR}" || -d "${DATA_DIR}" ]] || die "data path is not a directory"
+readonly DATA_PARENT="${DATA_DIR%/*}"
+readonly DATA_NAME="${DATA_DIR##*/}"
+[[ -d "${DATA_PARENT:-/}" ]] || die "data parent directory does not exist"
+
+# Keep the selected snapshot alive while receiver retention is running.
+# Acquire locks in the same order as the receiver: receive, then standby.
+exec 8>"${BACKUP_ROOT}/receive.lock"
+flock -n 8 || die "another snapshot operation is already running"
 
 verify_snapshot() {
     local source="${1}"
@@ -103,9 +114,9 @@ stage_snapshot() {
     local destination="${2}"
     local database_check
 
-    cp -a -- "${source}/data/." "${destination}/"
-    rm -f -- "${destination}/db.sqlite3-wal" "${destination}/db.sqlite3-shm"
-    database_check="$(sqlite3 "${destination}/db.sqlite3" 'PRAGMA integrity_check;')"
+    cp -a -- "${source}/data/." "${destination}/" || return
+    rm -f -- "${destination}/db.sqlite3-wal" "${destination}/db.sqlite3-shm" || return
+    database_check="$(sqlite3 "${destination}/db.sqlite3" 'PRAGMA integrity_check;')" || return
     [[ "${database_check}" == "ok" ]] || die "staged database failed SQLite integrity_check"
 }
 
@@ -135,7 +146,7 @@ verify_snapshot "${snapshot}"
 
 snapshot_id="$(basename -- "${snapshot}")"
 if "${verify_only}"; then
-    verify_stage="$(mktemp -d "${STACK_DIR}/mnt/.verify-restore.XXXXXX")"
+    verify_stage="$(mktemp -d "${DATA_PARENT}/.${DATA_NAME}.verify.XXXXXX")"
     trap 'rm -rf -- "${verify_stage}"' EXIT
     stage_snapshot "${snapshot}" "${verify_stage}"
     printf 'vaultwarden snapshot verified: %s\n' "${snapshot_id}"
@@ -143,53 +154,108 @@ if "${verify_only}"; then
 fi
 
 [[ -f "${COMPOSE_FILE}" ]] || die "compose file does not exist: ${COMPOSE_FILE}"
+require_command docker
 exec 9>"${BACKUP_ROOT}/standby.lock"
 flock -n 9 || die "another restore or standby refresh is already running"
 
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-stage="$(mktemp -d "${STACK_DIR}/mnt/.restore.XXXXXX")"
-rollback="${STACK_DIR}/mnt/data.rollback-${stamp}"
-failed="${STACK_DIR}/mnt/data.failed-${stamp}"
-trap '[[ ! -d "${stage}" ]] || rm -rf -- "${stage}"' EXIT
+# Every rename stays on the data filesystem, including custom DATA_DIR paths.
+transaction_dir="$(mktemp -d "${DATA_PARENT}/.${DATA_NAME}.restore.XXXXXX")"
+stage="${transaction_dir}/candidate"
+rollback="${transaction_dir}/previous"
+failed="${transaction_dir}/failed"
+transaction_started=false
+committed=false
+previous_running=false
 
-stage_snapshot "${snapshot}" "${stage}"
-
-docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" stop "${SERVICE_NAME}"
-[[ ! -e "${DATA_DIR}" ]] || mv -- "${DATA_DIR}" "${rollback}"
-mv -- "${stage}" "${DATA_DIR}"
-
-restore_previous() {
-    docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" stop "${SERVICE_NAME}" || true
-    [[ ! -e "${DATA_DIR}" ]] || mv -- "${DATA_DIR}" "${failed}"
-    if [[ -d "${rollback}" ]]; then
-        mv -- "${rollback}" "${DATA_DIR}"
-        docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" up -d "${SERVICE_NAME}" || true
-    fi
+run_compose() {
+    docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" "$@"
 }
 
-if ! docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" up -d "${SERVICE_NAME}"; then
-    restore_previous
-    die "restore failed; previous data was restored"
-fi
+# Return failure to the transaction owner; callers may deliberately test status.
+wait_for_service() {
+    local container status attempt
 
-container="$(docker compose --project-directory "${STACK_DIR}" -f "${COMPOSE_FILE}" ps -q "${SERVICE_NAME}")"
-if [[ -z "${container}" ]]; then
-    restore_previous
-    die "restore failed; Vaultwarden container was not found"
-fi
+    # shellcheck disable=SC2310
+    container="$(run_compose ps -q "${SERVICE_NAME}")" || return
+    [[ -n "${container}" && "${container}" != *$'\n'* ]] || return 1
+    for ((attempt = 1; attempt <= HEALTH_TIMEOUT_SECONDS; attempt++)); do
+        status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else if .State.Running}}running{{else}}stopped{{end}}' "${container}")" || return
+        case "${status}" in
+            healthy | running) return 0 ;;
+            unhealthy | stopped) return 1 ;;
+            *) ;;
+        esac
+        sleep 1 || return
+    done
+    return 1
+}
 
-for ((attempt = 1; attempt <= HEALTH_TIMEOUT_SECONDS; attempt++)); do
-    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else if .State.Running}}running{{else}}stopped{{end}}' "${container}")"
-    case "${status}" in
-        healthy | running)
-            printf 'vaultwarden restored: %s\n' "${snapshot_id}"
-            exit 0
-            ;;
-        unhealthy | stopped) break ;;
-        *) ;;
-    esac
-    sleep 1
-done
+# Every operation in the recovery path propagates failure explicitly.
+restore_previous() {
+    # Directory presence records successful atomic moves even if a signal
+    # arrives before the next shell assignment can run.
+    if [[ -d "${rollback}" || ! -d "${stage}" ]]; then
+        # shellcheck disable=SC2310
+        run_compose stop "${SERVICE_NAME}" || return
+        if [[ ! -d "${stage}" && -e "${DATA_DIR}" ]]; then
+            mv -T -- "${DATA_DIR}" "${failed}" || return
+        fi
+        if [[ -d "${rollback}" ]]; then
+            mv -T -- "${rollback}" "${DATA_DIR}" || return
+        fi
+    fi
+    if [[ "${previous_running}" == true ]]; then
+        # shellcheck disable=SC2310
+        run_compose up -d "${SERVICE_NAME}" || return
+        # shellcheck disable=SC2310
+        wait_for_service || return
+    fi
+    return 0
+}
 
-restore_previous
-die "restore failed health verification; previous data was restored"
+# Recovery failure preserves the transaction rather than removing its evidence.
+finish_restore() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    if [[ "${transaction_started}" == true && "${committed}" != true ]]; then
+        # The original failure must stay visible even when rollback succeeds.
+        status=1
+        # shellcheck disable=SC2310
+        if restore_previous; then
+            printf 'restore failed; previous data and service state restored\n' >&2
+        else
+            printf 'restore rollback failed; recovery files retained at %s\n' "${transaction_dir}" >&2
+            exit 1
+        fi
+    fi
+    rm -rf -- "${stage}" || status=1
+    if [[ -d "${rollback}" || -d "${failed}" ]]; then
+        printf 'recovery files retained at %s\n' "${transaction_dir}" >&2
+    else
+        rmdir -- "${transaction_dir}" || status=1
+    fi
+    exit "${status}"
+}
+trap finish_restore EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -- "${stage}"
+stage_snapshot "${snapshot}" "${stage}"
+# run_compose is a transparent command wrapper; inspect its exit status.
+# shellcheck disable=SC2310
+previous_containers="$(run_compose ps --status running -q "${SERVICE_NAME}")" ||
+    die "cannot determine the previous service state"
+[[ -z "${previous_containers}" ]] || previous_running=true
+
+transaction_started=true
+run_compose stop "${SERVICE_NAME}"
+[[ ! -e "${DATA_DIR}" ]] || mv -T -- "${DATA_DIR}" "${rollback}"
+mv -T -- "${stage}" "${DATA_DIR}"
+run_compose up -d "${SERVICE_NAME}"
+# wait_for_service checks every operation without relying on errexit.
+# shellcheck disable=SC2310
+wait_for_service || die "restored service failed startup or health verification"
+committed=true
+printf 'vaultwarden restored: %s\n' "${snapshot_id}"

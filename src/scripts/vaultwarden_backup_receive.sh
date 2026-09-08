@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Vaultwarden Backup Receiver
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Intended as an authorized_keys forced command. It accepts one archive on
 # standard input, validates paths, checksums and SQLite integrity, then
@@ -153,7 +151,10 @@ if [[ -n "${STANDBY_MOUNT}" ]]; then
     exec 8>"${BACKUP_ROOT}/standby.lock"
     flock -w 300 8 || die "timed out waiting for the standby lock"
 
-    if docker ps -q --filter "label=${CONTAINER_LABEL}" | grep -q .; then
+    # An unavailable daemon does not establish that the standby is stopped.
+    running_containers="$(docker ps -q --filter "label=${CONTAINER_LABEL}")" ||
+        die "cannot determine whether Vaultwarden is running; standby left untouched"
+    if [[ -n "${running_containers}" ]]; then
         printf 'vaultwarden is running; standby refresh skipped\n'
     else
         standby_data="${STANDBY_MOUNT}/data"
