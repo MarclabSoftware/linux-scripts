@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Video-to-MP4 Converter
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Recursively converts configured source formats to MP4 without deleting the
 # originals. H.264/HEVC video is remuxed when possible; older codecs are
@@ -26,9 +24,6 @@ IDET_FRAMES="${MEDIA_IDET_FRAMES:-200}"
 TEMP_DIR=""
 FAILURES=0
 
-cleanup() {
-    [[ -z "${TEMP_DIR}" ]] || rm -rf -- "${TEMP_DIR}"
-}
 trap cleanup EXIT
 
 validate_config() {
@@ -45,91 +40,30 @@ validate_config() {
         media_die "MEDIA_IDET_FRAMES must be a positive integer"
 }
 
-codec_name() {
-    ffprobe \
-        -v error \
-        -select_streams "$2" \
-        -show_entries stream=codec_name \
-        -of default=noprint_wrappers=1:nokey=1 \
-        "$1" |
-        tr -d '[:space:]'
-}
-
-idet_count() {
-    local label="$1"
-    local output="$2"
-    local count
-
-    count="$(
-        sed -nE "s/.*${label}:[[:space:]]*([0-9]+).*/\\1/p" <<<"${output}" |
-            tail -n 1
-    )"
-    printf '%s\n' "${count:-0}"
-}
-
-detect_filter() {
-    local input_file="$1"
-    local idet_output tff bff progressive
-
-    media_log INFO "Analyzing interlacing: ${input_file}"
-    idet_output="$(
-        ffmpeg -nostdin -hide_banner -v info -i "${input_file}" \
-            -filter:v idet -frames:v "${IDET_FRAMES}" -an -f null - 2>&1 || true
-    )"
-    tff="$(idet_count TFF "${idet_output}")"
-    bff="$(idet_count BFF "${idet_output}")"
-    progressive="$(idet_count Progressive "${idet_output}")"
-
-    if ((10#${tff} + 10#${bff} > 10#${progressive})); then
-        media_log INFO "Interlaced source detected (TFF=${tff}, BFF=${bff}, progressive=${progressive})"
-        printf 'bwdif=mode=1:parity=-1:deint=1,format=yuv420p\n'
-    else
-        printf 'format=yuv420p\n'
-    fi
-}
-
+# Per-file errors are aggregated by the caller; every mutating step is checked.
 process_video() {
     local input_file="$1"
     local output_file="${input_file%.*}.mp4"
-    local video_codec audio_codec filter_chain temp_file
-    local -a video_options audio_options
+    local temp_file
+    local -a ffmpeg_options
 
-    if [[ -e "${output_file}" ]]; then
+    if [[ -e "${output_file}" || -L "${output_file}" ]]; then
         media_log INFO "Skipping existing output: ${output_file}"
         return 0
     fi
 
-    # Missing streams are expected probe outcomes and handled below.
     # shellcheck disable=SC2310
-    video_codec="$(codec_name "${input_file}" v:0 || true)"
-    # shellcheck disable=SC2310
-    audio_codec="$(codec_name "${input_file}" a:0 || true)"
-    [[ -n "${video_codec}" ]] || {
-        media_log ERROR "No readable video stream: ${input_file}"
+    if ! media_mp4_options "${input_file}" ffmpeg_options convert; then
+        media_log ERROR "Cannot prepare video conversion: ${input_file}"
         return 1
-    }
-
-    temp_file="${TEMP_DIR}/output-${RANDOM}.mp4"
-    if [[ "${video_codec}" == "h264" || "${video_codec}" == "hevc" ]]; then
-        video_options=(-c:v copy)
-        if [[ "${audio_codec}" == "aac" || "${audio_codec}" == "mp3" || "${audio_codec}" == "ac3" || -z "${audio_codec}" ]]; then
-            audio_options=(-c:a copy)
-        else
-            audio_options=(-c:a aac -b:a "${AUDIO_BITRATE}")
-        fi
-        media_log INFO "Remuxing ${input_file} (video=${video_codec}, audio=${audio_codec:-none})"
-    else
-        filter_chain="$(detect_filter "${input_file}")"
-        video_options=(-c:v libx264 -crf "${VIDEO_CRF}" -preset "${VIDEO_PRESET}" -tune film -vf "${filter_chain}")
-        audio_options=(-c:a aac -b:a "${AUDIO_BITRATE}")
-        media_log INFO "Transcoding ${input_file} (video=${video_codec}, audio=${audio_codec:-none})"
     fi
+    # shellcheck disable=SC2310
+    media_prepare_output "${output_file}" mp4 || return
+    temp_file="${MEDIA_OUTPUT_FILE}"
+    media_log INFO "Converting all streams: ${input_file}"
 
     if ! ffmpeg -nostdin -hide_banner -v error -stats -i "${input_file}" \
-        -map_metadata 0 \
-        "${video_options[@]}" \
-        "${audio_options[@]}" \
-        -movflags +faststart+use_metadata_tags \
+        "${ffmpeg_options[@]}" \
         "${temp_file}"; then
         media_log ERROR "FFmpeg failed: ${input_file}"
         rm -f -- "${temp_file}"
@@ -143,14 +77,17 @@ process_video() {
     fi
     # A failed output probe is an expected validation result.
     # shellcheck disable=SC2310
-    if ! codec_name "${temp_file}" v:0 >/dev/null; then
+    if ! media_validate_streams "${input_file}" "${temp_file}"; then
         media_log ERROR "Converted output failed validation: ${input_file}"
         rm -f -- "${temp_file}"
         return 1
     fi
 
-    touch -r "${input_file}" "${temp_file}"
-    mv -- "${temp_file}" "${output_file}"
+    # shellcheck disable=SC2310
+    media_publish_output "${input_file}" "${output_file}" || {
+        media_log ERROR "Cannot publish converted output: ${output_file}"
+        return 1
+    }
     media_log INFO "Created ${output_file}"
 }
 
@@ -171,7 +108,7 @@ esac
 (($# == 1)) || media_die "usage: convert_to_mp4.sh DIRECTORY"
 validate_config
 [[ -d "$1" ]] || media_die "directory not found: $1"
-for command_name in ffmpeg ffprobe find sed tail tr; do
+for command_name in ffmpeg ffprobe find sed; do
     media_require_command "${command_name}"
 done
 

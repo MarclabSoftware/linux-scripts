@@ -8,7 +8,7 @@ IFS=$'\n\t'
 for command_name in ffmpeg ffprobe; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
         printf 'media processing test skipped: %s is unavailable\n' "${command_name}"
-        exit 0
+        exit 77
     fi
 done
 

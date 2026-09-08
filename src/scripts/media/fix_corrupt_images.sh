@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Corrupt Image Repair
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Recursively validates common image formats and attempts to decode/re-encode
 # damaged files with FFmpeg. Successful repairs can preserve the original as
@@ -26,9 +24,6 @@ CORRUPT=0
 REPAIRED=0
 FAILED=0
 
-cleanup() {
-    [[ -z "${TEMP_DIR}" ]] || rm -rf -- "${TEMP_DIR}"
-}
 trap cleanup EXIT
 
 validate_config() {
@@ -56,10 +51,11 @@ is_corrupt() {
     return 0
 }
 
+# Preserve the source until the validated replacement can be published.
 repair_image() {
     local file="$1"
     local extension="${file##*.}"
-    local temp_file="${TEMP_DIR}/image-${RANDOM}.${extension}"
+    local temp_file backup=""
     local original_copy="${file}.CORRUPT"
 
     if [[ "${KEEP_ORIGINAL}" == "1" && -e "${original_copy}" ]]; then
@@ -67,6 +63,9 @@ repair_image() {
         return 1
     fi
 
+    # shellcheck disable=SC2310
+    media_prepare_output "${file}" "${extension}" || return
+    temp_file="${MEDIA_OUTPUT_FILE}"
     media_log INFO "Attempting repair: ${file}"
     if ! ffmpeg -y -nostdin -hide_banner -v error -i "${file}" \
         -map_metadata 0 -q:v 2 "${temp_file}" >/dev/null 2>&1; then
@@ -84,11 +83,12 @@ repair_image() {
         return 1
     fi
 
-    touch -r "${file}" "${temp_file}"
-    if [[ "${KEEP_ORIGINAL}" == "1" ]]; then
-        mv -- "${file}" "${original_copy}"
-    fi
-    mv -- "${temp_file}" "${file}"
+    [[ "${KEEP_ORIGINAL}" != "1" ]] || backup="${original_copy}"
+    # shellcheck disable=SC2310
+    media_publish_output "${file}" "${file}" "${backup}" || {
+        media_log ERROR "Cannot publish repaired image: ${file}"
+        return 1
+    }
     media_log INFO "Repaired ${file}"
 }
 
@@ -104,7 +104,8 @@ mark_unrepairable() {
         media_log ERROR "Repair failed and marker destination exists: ${broken_file}"
         return 1
     fi
-    mv -- "${file}" "${broken_file}"
+    mv -nT -- "${file}" "${broken_file}" || return
+    [[ ! -e "${file}" ]] || return 1
     media_log WARN "Repair failed; renamed file to ${broken_file}"
 }
 

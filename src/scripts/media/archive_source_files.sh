@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Converted Source File Archiver
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Moves legacy video sources to a separate archive only when a same-name MP4
 # exists beside the source. Directory structure is preserved, existing archive
@@ -41,8 +39,8 @@ archive_file() {
 
     relative_path="${source_file#"${scan_root}"/}"
     destination="${archive_root}/${relative_path}"
-    if [[ -e "${destination}" ]]; then
-        media_log ERROR "Archive destination already exists; source left untouched: ${destination}"
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+        media_log WARN "Archive destination already exists; source left untouched: ${destination}"
         return 0
     fi
 
@@ -51,8 +49,8 @@ archive_file() {
         return 0
     fi
 
-    mkdir -p -- "$(dirname -- "${destination}")"
-    mv -n -- "${source_file}" "${destination}"
+    mkdir -p -- "${destination%/*}" || media_die "could not create archive directory"
+    mv -nT -- "${source_file}" "${destination}" || media_die "could not archive source: ${source_file}"
     [[ ! -e "${source_file}" ]] ||
         media_die "could not move source without overwriting: ${source_file}"
     media_log INFO "Archived: ${relative_path}"
@@ -90,16 +88,15 @@ media_validate_boolean DRY_RUN "${DRY_RUN}"
 [[ -n "${SOURCE_EXTENSIONS//[[:space:]]/}" ]] ||
     media_die "MEDIA_SOURCE_EXTENSIONS must not be empty"
 
-for command_name in find mktemp realpath; do
+for command_name in find realpath; do
     media_require_command "${command_name}"
 done
 
 scan_dir="$(realpath -e -- "$1")"
 [[ -d "${scan_dir}" ]] || media_die "scan path is not a directory: $1"
-mkdir -p -- "$2"
-archive_dir="$(realpath -e -- "$2")"
-[[ -d "${archive_dir}" ]] || media_die "archive path is not a directory: $2"
-[[ "${archive_dir}" != "${scan_dir}" && "${archive_dir}" != "${scan_dir}/"* ]] ||
+archive_dir="$(realpath -m -- "$2")"
+[[ ! -e "${archive_dir}" || -d "${archive_dir}" ]] || media_die "archive path is not a directory: $2"
+[[ "${archive_dir}" != "${scan_dir}" && "${archive_dir}" != "${scan_dir%/}/"* ]] ||
     media_die "archive directory must be outside the scan directory"
 
 IFS=' ' read -r -a extensions <<<"${SOURCE_EXTENSIONS}"
@@ -112,11 +109,17 @@ for extension in "${extensions[@]}"; do
     find_args+=(-iname "*.${extension}")
 done
 
+[[ "${DRY_RUN}" != 1 ]] || MEDIA_LOG_FILE=""
 media_log INFO "Scanning ${scan_dir}"
-file_list="$(mktemp)"
-trap 'rm -f -- "${file_list}"' EXIT
-find "${scan_dir}" -type f \( "${find_args[@]}" \) -print0 >"${file_list}"
+# Stream filenames through a pipe and wait for find explicitly: dry-run writes
+# neither an archive directory, a temporary listing, nor a configured log file.
+# find status is collected with wait below; the listing stays streamed.
+# shellcheck disable=SC2312
+exec {scan_fd}< <(find "${scan_dir}" -type f \( "${find_args[@]}" \) -print0)
+scan_pid=$!
 while IFS= read -r -d '' source_file; do
     archive_file "${source_file}" "${scan_dir}" "${archive_dir}"
-done <"${file_list}"
+done <&"${scan_fd}"
+exec {scan_fd}<&-
+wait "${scan_pid}" || media_die "could not complete source scan"
 media_log INFO "Archive operation completed"

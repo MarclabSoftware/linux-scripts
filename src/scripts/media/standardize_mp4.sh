@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
 # MP4 Standardizer
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Recursively validates MP4 files, remuxes modern codecs with fast-start
-# metadata, and transcodes legacy video to H.264/AAC. Invalid files are renamed
+# metadata, and transcodes legacy video to H.264 while copying audio/subtitles.
+# Invalid files are renamed
 # to .BROKEN without overwriting an existing diagnostic copy.
 
 set -Eeuo pipefail
@@ -27,9 +26,6 @@ MARK_BROKEN="${MEDIA_MARK_UNREPAIRABLE:-1}"
 TEMP_DIR=""
 FAILURES=0
 
-cleanup() {
-    [[ -z "${TEMP_DIR}" ]] || rm -rf -- "${TEMP_DIR}"
-}
 trap cleanup EXIT
 
 validate_config() {
@@ -47,47 +43,6 @@ validate_config() {
     media_validate_boolean MEDIA_MARK_UNREPAIRABLE "${MARK_BROKEN}"
 }
 
-codec_name() {
-    ffprobe \
-        -v error \
-        -select_streams v:0 \
-        -show_entries stream=codec_name \
-        -of default=noprint_wrappers=1:nokey=1 \
-        "$1" |
-        tr -d '[:space:]'
-}
-
-idet_count() {
-    local label="$1"
-    local output="$2"
-    local count
-
-    count="$(
-        sed -nE "s/.*${label}:[[:space:]]*([0-9]+).*/\\1/p" <<<"${output}" |
-            tail -n 1
-    )"
-    printf '%s\n' "${count:-0}"
-}
-
-detect_filter() {
-    local input_file="$1"
-    local idet_output tff bff progressive
-
-    idet_output="$(
-        ffmpeg -nostdin -hide_banner -v info -i "${input_file}" \
-            -filter:v idet -frames:v "${IDET_FRAMES}" -an -f null - 2>&1 || true
-    )"
-    tff="$(idet_count TFF "${idet_output}")"
-    bff="$(idet_count BFF "${idet_output}")"
-    progressive="$(idet_count Progressive "${idet_output}")"
-    if ((10#${tff} + 10#${bff} > 10#${progressive})); then
-        media_log INFO "Interlaced source detected: ${input_file}"
-        printf 'bwdif=mode=1:parity=-1:deint=1,format=yuv420p\n'
-    else
-        printf 'format=yuv420p\n'
-    fi
-}
-
 mark_broken() {
     local input_file="$1"
     local broken_file="${input_file}.BROKEN"
@@ -100,13 +55,15 @@ mark_broken() {
         media_log ERROR "Cannot mark invalid MP4; destination exists: ${broken_file}"
         return 1
     fi
-    mv -- "${input_file}" "${broken_file}"
+    mv -nT -- "${input_file}" "${broken_file}" || return
+    [[ ! -e "${input_file}" ]] || return 1
     media_log WARN "Renamed invalid MP4 to ${broken_file}"
 }
 
+# Per-file errors are aggregated by the caller; every mutating step is checked.
 process_mp4() {
     local input_file="$1"
-    local input_size video_codec filter_chain temp_file
+    local input_size video_codec temp_file
     local -a ffmpeg_options
 
     input_size="$(stat -c %s -- "${input_file}")" || {
@@ -116,7 +73,7 @@ process_mp4() {
     if ((input_size < MIN_VIDEO_BYTES)); then
         media_log ERROR "MP4 is smaller than ${MIN_VIDEO_BYTES} bytes: ${input_file}"
         mark_broken "${input_file}"
-        return
+        return 1
     fi
 
     # Missing streams are expected probe outcomes and handled below.
@@ -125,29 +82,16 @@ process_mp4() {
     if [[ -z "${video_codec}" ]]; then
         media_log ERROR "No readable video stream: ${input_file}"
         mark_broken "${input_file}"
-        return
+        return 1
     fi
 
-    if [[ "${video_codec}" == "h264" || "${video_codec}" == "hevc" || "${video_codec}" == "av1" ]]; then
-        ffmpeg_options=(-c copy -map_metadata 0 -movflags +faststart+use_metadata_tags)
-        media_log INFO "Remuxing modern MP4 (${video_codec}): ${input_file}"
-    else
-        filter_chain="$(detect_filter "${input_file}")"
-        ffmpeg_options=(
-            -c:v libx264
-            -crf "${VIDEO_CRF}"
-            -preset "${VIDEO_PRESET}"
-            -tune film
-            -vf "${filter_chain}"
-            -c:a aac
-            -b:a "${AUDIO_BITRATE}"
-            -map_metadata 0
-            -movflags +faststart+use_metadata_tags
-        )
-        media_log INFO "Transcoding legacy MP4 (${video_codec}): ${input_file}"
-    fi
+    # shellcheck disable=SC2310
+    media_mp4_options "${input_file}" ffmpeg_options standardize || return
+    media_log INFO "Standardizing all MP4 streams: ${input_file}"
 
-    temp_file="${TEMP_DIR}/output-${RANDOM}.mp4"
+    # shellcheck disable=SC2310
+    media_prepare_output "${input_file}" mp4 || return
+    temp_file="${MEDIA_OUTPUT_FILE}"
     if ! ffmpeg -nostdin -hide_banner -v error -stats -i "${input_file}" \
         "${ffmpeg_options[@]}" "${temp_file}"; then
         media_log ERROR "FFmpeg failed; original left untouched: ${input_file}"
@@ -161,14 +105,17 @@ process_mp4() {
     fi
     # A failed output probe is an expected validation result.
     # shellcheck disable=SC2310
-    if ! codec_name "${temp_file}" >/dev/null; then
+    if ! media_validate_streams "${input_file}" "${temp_file}"; then
         media_log ERROR "Standardized output failed validation: ${input_file}"
         rm -f -- "${temp_file}"
         return 1
     fi
 
-    touch -r "${input_file}" "${temp_file}"
-    mv -- "${temp_file}" "${input_file}"
+    # shellcheck disable=SC2310
+    media_publish_output "${input_file}" "${input_file}" || {
+        media_log ERROR "Cannot publish standardized output: ${input_file}"
+        return 1
+    }
     media_log INFO "Updated ${input_file}"
 }
 
@@ -189,7 +136,7 @@ esac
 (($# == 1)) || media_die "usage: standardize_mp4.sh DIRECTORY"
 validate_config
 [[ -d "$1" ]] || media_die "directory not found: $1"
-for command_name in ffmpeg ffprobe find sed stat tail tr; do
+for command_name in ffmpeg ffprobe find sed stat; do
     media_require_command "${command_name}"
 done
 

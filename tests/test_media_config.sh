@@ -15,9 +15,10 @@ for script_name in \
     convert_to_mp4.sh \
     fix_corrupt_images.sh \
     standardize_mp4.sh; do
-    MEDIA_ENV_FILE=/nonexistent \
+    MEDIA_ENV_FILE=/nonexistent MEDIA_LOG_FILE="${TEST_DIR}/check-logs/run.log" \
         "${MEDIA_DIR}/${script_name}" --check-config >/dev/null
 done
+[[ ! -e "${TEST_DIR}/check-logs" ]]
 FFMPEG_INSTALL_ENV_FILE=/nonexistent \
     "${MEDIA_DIR}/install_static_ffmpeg.sh" --check-config >/dev/null
 
@@ -31,15 +32,16 @@ fi
 
 scan_dir="${TEST_DIR}/scan"
 archive_dir="${TEST_DIR}/archive"
-mkdir -p -- "${scan_dir}/nested" "${archive_dir}/nested"
+mkdir -p -- "${scan_dir}/nested"
 printf 'source\n' >"${scan_dir}/nested/video.avi"
 printf 'converted\n' >"${scan_dir}/nested/video.mp4"
 
-MEDIA_ENV_FILE=/nonexistent \
+MEDIA_ENV_FILE=/nonexistent MEDIA_LOG_FILE="${TEST_DIR}/dry-logs/run.log" TMPDIR="${TEST_DIR}/unused-temp" \
     "${MEDIA_DIR}/archive_source_files.sh" --dry-run \
     "${scan_dir}" "${archive_dir}" >/dev/null
 [[ -f "${scan_dir}/nested/video.avi" ]]
 [[ ! -e "${archive_dir}/nested/video.avi" ]]
+[[ ! -e "${archive_dir}" && ! -e "${TEST_DIR}/dry-logs" && ! -e "${TEST_DIR}/unused-temp" ]]
 
 MEDIA_ENV_FILE=/nonexistent \
     "${MEDIA_DIR}/archive_source_files.sh" \
@@ -54,5 +56,14 @@ MEDIA_ENV_FILE=/nonexistent \
 [[ -f "${scan_dir}/nested/video.avi" ]]
 archived_content="$(cat -- "${archive_dir}/nested/video.avi")"
 [[ "${archived_content}" == "source" ]]
+
+mkdir -- "${TEST_DIR}/bin"
+printf '#!/usr/bin/env bash\nexit 23\n' >"${TEST_DIR}/bin/find"
+chmod 0700 -- "${TEST_DIR}/bin/find"
+if MEDIA_ENV_FILE=/nonexistent PATH="${TEST_DIR}/bin:${PATH}" \
+    "${MEDIA_DIR}/archive_source_files.sh" --dry-run "${scan_dir}" "${archive_dir}" >/dev/null 2>&1; then
+    printf 'failed source scan reported success\n' >&2
+    exit 1
+fi
 
 printf 'media configuration tests passed\n'

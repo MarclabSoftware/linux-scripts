@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Verified Static FFmpeg Installer
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Downloads a current BtbN GPL static build, verifies it against the release
 # checksum manifest, and installs ffmpeg/ffprobe plus optional ffplay. x86_64
