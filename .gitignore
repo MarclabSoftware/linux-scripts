@@ -12,6 +12,7 @@ build
 *.key
 *.pem
 *.pfx
+*.p12
 credentials/
 
 # Private host inventories and runtime output.
