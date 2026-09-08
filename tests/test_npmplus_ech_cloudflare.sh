@@ -113,8 +113,24 @@ elif [[ ${url} == */dns_records/${record_id} && ${method} == PATCH ]]; then
             printf '{"success":false,"errors":[{"code":1001,"message":"transport failure"}]}\n'
             exit 22
             ;;
-        *) printf '{"success":true,"result":{"type":"HTTPS"}}\n' ;;
+        ambiguous-patch | unverifiable-patch | unexpected-value)
+            exit 28
+            ;;
+        *)
+            jq -n --arg id "${record_id}" --argjson payload "${payload}" \
+                '{success:true,result:{id:$id,type:"HTTPS",name:"ech.example.com",data:{priority:1,target:".",value:$payload.data.value}}}'
+            ;;
     esac
+elif [[ ${url} == */dns_records/${record_id} && ${method} == GET ]]; then
+    [[ "${mode}" != unverifiable-patch ]] || exit 28
+    value=old
+    if [[ "${mode}" == ambiguous-patch ]]; then
+        value="$(jq -r '.data.value' "${CURL_PAYLOAD_LOG}")"
+    elif [[ "${mode}" == unexpected-value ]]; then
+        value=concurrent-record-value
+    fi
+    jq -n --arg id "${record_id}" --arg value "${value}" \
+        '{success:true,result:{id:$id,type:"HTTPS",name:"ech.example.com",data:{priority:1,target:".",value:$value}}}'
 else
     printf 'Unexpected curl request: %s %s\n' "${method}" "${url}" >&2
     exit 99
@@ -132,6 +148,7 @@ export PATH="${fake_bin}:${PATH}"
 
 reset_prepared_state() {
     rm -f -- "${ech_dir}/shared-current.ech" "${ech_dir}/shared-previous.ech"
+    rm -f -- "${ech_dir}"/.npmplus_ech_cloudflare.*
     printf 'old-key\n' >"${ech_dir}/shared-current.ech"
     jq -n '{current: [], previous: [11]}' >"${ech_dir}/config-ids.json"
     : >"${CURL_ARGS_LOG}"
@@ -143,12 +160,14 @@ reset_prepared_state() {
 }
 
 assert_committed() {
+    [[ ! -e "${ech_dir}/.npmplus_ech_cloudflare.pending" ]]
     [[ $(<"${ech_dir}/shared-current.ech") == new-key ]]
     [[ $(<"${ech_dir}/shared-previous.ech") == old-key ]]
     jq -e '.current == [22] and .previous == [11]' "${ech_dir}/config-ids.json" >/dev/null
 }
 
 assert_rolled_back() {
+    [[ ! -e "${ech_dir}/.npmplus_ech_cloudflare.pending" ]]
     [[ $(<"${ech_dir}/shared-current.ech") == old-key ]]
     [[ ! -e ${ech_dir}/shared-previous.ech ]]
     jq -e '.current == [11] and .previous == []' "${ech_dir}/config-ids.json" >/dev/null
@@ -213,6 +232,62 @@ if CURL_TEST_MODE=transport-error "${ech_dir}/cron.sh" >/dev/null 2>&1; then
     exit 1
 fi
 assert_rolled_back
+
+reset_prepared_state
+CURL_TEST_MODE=ambiguous-patch "${ech_dir}/cron.sh" >"${TEST_TMP}/ambiguous.output"
+assert_committed
+assert_token_private
+grep -Fq 'Confirmed ECH publication with a record lookup' "${TEST_TMP}/ambiguous.output"
+grep -Fxq 'GET:22222222222222222222222222222222' "${EVENT_LOG}"
+
+for mode in unverifiable-patch unexpected-value; do
+    reset_prepared_state
+    if CURL_TEST_MODE="${mode}" "${ech_dir}/cron.sh" >"${TEST_TMP}/uncertain.output" 2>&1; then
+        printf 'uncertain ECH publication reported success\n' >&2
+        exit 1
+    fi
+    marker="${ech_dir}/.npmplus_ech_cloudflare.pending"
+    [[ -f "${marker}" ]]
+    old_key="$(jq -r .previous_key_file "${marker}")"
+    new_key="$(jq -r .new_key_file "${marker}")"
+    old_ids="$(jq -r .previous_ids_file "${marker}")"
+    new_ids="$(jq -r .new_ids_file "${marker}")"
+    grep -qxF old-key "${old_key}"
+    grep -qxF new-key "${new_key}"
+    jq -e '.current == [11] and .previous == []' "${old_ids}" >/dev/null
+    jq -e '.current == [22] and .previous == [11]' "${new_ids}" >/dev/null
+    [[ $(<"${ech_dir}/shared-current.ech") == new-key ]]
+    [[ $(<"${ech_dir}/shared-previous.ech") == old-key ]]
+    grep -Fq 'both key generations and IDs retained' "${TEST_TMP}/uncertain.output"
+    before="$(cat "${EVENT_LOG}")"
+    if "${ech_dir}/cron.sh" >"${TEST_TMP}/blocked.output" 2>&1; then
+        printf 'unresolved ECH publication allowed another rotation\n' >&2
+        exit 1
+    fi
+    after="$(cat "${EVENT_LOG}")"
+    [[ "${before}" == "${after}" ]]
+    grep -Fq 'earlier publication needs recovery' "${TEST_TMP}/blocked.output"
+done
+
+reset_prepared_state
+cat >"${fake_bin}/cp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${*: -1}" != *.restore ]] || exit 23
+exec /usr/bin/cp "$@"
+EOF
+chmod 0700 -- "${fake_bin}/cp"
+if CURL_TEST_MODE=transport-error "${ech_dir}/cron.sh" >"${TEST_TMP}/rollback.output" 2>&1; then
+    printf 'failed ECH rollback reported success\n' >&2
+    exit 1
+fi
+grep -Fq 'ECH rollback failed; backups retained' "${TEST_TMP}/rollback.output"
+marker="${ech_dir}/.npmplus_ech_cloudflare.pending"
+old_key="$(jq -r .previous_key_file "${marker}")"
+new_key="$(jq -r .new_key_file "${marker}")"
+grep -qxF old-key "${old_key}"
+grep -qxF new-key "${new_key}"
+rm -- "${fake_bin}/cp"
 
 reset_prepared_state
 if ECH_TEST_MODE=fail "${ech_dir}/cron.sh" >/dev/null 2>&1; then

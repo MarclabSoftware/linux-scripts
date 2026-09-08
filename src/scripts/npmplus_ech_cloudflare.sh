@@ -7,7 +7,8 @@
 #
 # The script creates the Cloudflare HTTPS record when needed. It owns
 # data.value (configured SvcParams plus ECH) but preserves every other field
-# after creation. A failed API update rolls the local ECH key rotation back.
+# after creation. Ambiguous updates are checked against the remote record before
+# rollback; an unresolved publication retains both generations for recovery.
 
 set -eu
 umask 077
@@ -138,6 +139,10 @@ config_ids=${ech_dir}/config-ids.json
 current_key=${ech_dir}/${ECH_IDENTIFIER}-current.ech
 previous_key=${ech_dir}/${ECH_IDENTIFIER}-previous.ech
 api=https://api.cloudflare.com/client/v4
+pending_marker=${ech_dir}/.npmplus_ech_cloudflare.pending
+
+[ ! -e "${pending_marker}" ] ||
+    die "an earlier publication needs recovery; inspect ${pending_marker} before another rotation"
 
 [ -d "${ech_dir}" ] && [ -w "${ech_dir}" ] ||
     die "ECH directory is not writable: ${ech_dir}"
@@ -191,20 +196,24 @@ fi
 
 rotation_started=false
 committed=false
+publication_uncertain=false
+pending_key=
+pending_ids=
+previous_dns_value=${ECH_SVC_PARAMS}
 
 rollback_rotation() {
     rollback_ok=true
-    rm -f -- "${current_key}" "${previous_key}" || rollback_ok=false
     if [ "${had_current}" = true ]; then
-        if mv -f -- "${rollback_key}" "${current_key}"; then
-            rollback_key=
-        else
+        if ! cp -p -- "${rollback_key}" "${rollback_key}.restore" ||
+            ! mv -f -- "${rollback_key}.restore" "${current_key}"; then
             rollback_ok=false
         fi
-    fi
-    if mv -f -- "${rollback_ids}" "${config_ids}"; then
-        rollback_ids=
     else
+        rm -f -- "${current_key}" || rollback_ok=false
+    fi
+    rm -f -- "${previous_key}" || rollback_ok=false
+    if ! cp -p -- "${rollback_ids}" "${rollback_ids}.restore" ||
+        ! mv -f -- "${rollback_ids}.restore" "${config_ids}"; then
         rollback_ok=false
     fi
     [ "${rollback_ok}" = true ]
@@ -214,17 +223,25 @@ finish() {
     status=$?
     trap - EXIT HUP INT TERM
     set +e
+    unset cf_api_token
 
+    if [ "${committed}" != true ] && [ "${publication_uncertain}" = true ]; then
+        printf 'npmplus_ech_cloudflare: publication uncertain; both key generations and IDs retained. Recovery state: %s\n' "${pending_marker}" >&2
+        exit 1
+    fi
     if [ "${rotation_started}" = true ] && [ "${committed}" != true ]; then
         # Errexit is deliberately disabled so every rollback step is attempted.
         # shellcheck disable=SC2310
         if ! rollback_rotation; then
-            printf 'npmplus_ech_cloudflare: CRITICAL: ECH rollback failed\n' >&2
-            status=1
+            printf 'npmplus_ech_cloudflare: CRITICAL: ECH rollback failed; backups retained: %s %s\n' "${rollback_key}" "${rollback_ids}" >&2
+            exit 1
         fi
     fi
+    rm -f -- "${pending_marker}" || status=1
     [ -z "${rollback_ids}" ] || rm -f -- "${rollback_ids}" || status=1
     [ -z "${rollback_key}" ] || rm -f -- "${rollback_key}" || status=1
+    [ -z "${pending_ids}" ] || rm -f -- "${pending_ids}" || status=1
+    [ -z "${pending_key}" ] || rm -f -- "${pending_key}" || status=1
     exit "${status}"
 }
 
@@ -290,9 +307,23 @@ lookup_https_record() {
                     .id |
                     select(type == "string" and test("^[0-9A-Fa-f]{32}$"))
                 ') || die "the existing HTTPS record is not priority 1 with target ."
+            previous_dns_value=$(printf '%s' "${record_matches}" |
+                jq -er '.[0].data.value | select(type == "string")') ||
+                die "the existing HTTPS record has no valid SvcParams value"
             ;;
         *) die "multiple HTTPS records exist for ECH_RECORD_NAME" ;;
     esac
+}
+
+# Require the exact record identity and service parameters before trusting its value.
+record_value_from_response() {
+    printf '%s' "$1" | jq -er --arg id "${record_id}" --arg name "${ECH_RECORD_NAME}" '
+        select(.success == true) | .result |
+        select(.id == $id and .type == "HTTPS" and
+            ((.name | ascii_downcase) == ($name | ascii_downcase)) and
+            .data.priority == 1 and .data.target == ".") |
+        .data.value | select(type == "string")
+    '
 }
 
 trap finish EXIT
@@ -393,23 +424,60 @@ payload=$(jq -n --arg value "${dns_value}" '{data: {value: $value}}') ||
     die "cannot build the Cloudflare request"
 endpoint=${api}/zones/${zone_id}/dns_records/${record_id}
 
-set +e
-response=$(cloudflare_retry \
+# Store both generations outside NPMplus's *.ech rotation pattern. A later
+# scheduler invocation may rearrange runtime files before it sees our failure.
+pending_key=$(mktemp "${ech_dir}/.npmplus_ech_cloudflare.next-key.XXXXXX") ||
+    die "cannot create the new-key recovery copy"
+pending_ids=$(mktemp "${ech_dir}/.npmplus_ech_cloudflare.next-ids.XXXXXX") ||
+    die "cannot create the new-state recovery copy"
+cp -p -- "${current_key}" "${pending_key}" || die "cannot preserve the new key"
+cp -p -- "${config_ids}" "${pending_ids}" || die "cannot preserve the new config IDs"
+jq -n --arg endpoint "${endpoint}" --arg old_value "${previous_dns_value}" --arg new_value "${dns_value}" \
+    --arg old_key "${rollback_key}" --arg old_ids "${rollback_ids}" \
+    --arg new_key "${pending_key}" --arg new_ids "${pending_ids}" \
+    '{endpoint: $endpoint, previous_value: $old_value, new_value: $new_value,
+      previous_key_file: $old_key, previous_ids_file: $old_ids,
+      new_key_file: $new_key, new_ids_file: $new_ids}' >"${pending_marker}" ||
+    die "cannot write ECH recovery state"
+
+publication_uncertain=true
+# This helper returns errors explicitly to the enclosing decision.
+# shellcheck disable=SC2310
+if response=$(cloudflare_retry \
     --request PATCH \
     --data-binary "${payload}" \
-    "${endpoint}")
-curl_status=$?
-set -e
-unset cf_api_token
-
-if [ "${curl_status}" -ne 0 ]; then
-    api_errors "${response}"
-    die "Cloudflare request failed (curl exit ${curl_status})"
+    "${endpoint}"); then
+    curl_status=0
+else
+    curl_status=$?
 fi
-if ! printf '%s' "${response}" | jq -e '.success == true and .result.type == "HTTPS"' >/dev/null; then
+
+# This helper returns errors explicitly to the enclosing decision.
+# shellcheck disable=SC2310
+if [ "${curl_status}" -eq 0 ] && confirmed_value=$(record_value_from_response "${response}") &&
+    [ "${confirmed_value}" = "${dns_value}" ]; then
+    :
+else
     api_errors "${response}"
-    die "Cloudflare did not confirm an HTTPS record update"
+    # A lost PATCH response does not prove rejection, even after retries.
+    # This helper returns errors explicitly to the enclosing decision.
+    # shellcheck disable=SC2310
+    if verification=$(cloudflare_retry --request GET "${endpoint}") &&
+        verified_value=$(record_value_from_response "${verification}"); then
+        if [ "${verified_value}" = "${dns_value}" ]; then
+            printf 'Confirmed ECH publication with a record lookup\n'
+        elif [ "${verified_value}" = "${previous_dns_value}" ]; then
+            publication_uncertain=false
+            die "Cloudflare retained the previous value; rolling back local rotation"
+        else
+            die "Cloudflare returned an unexpected record value; publication remains uncertain"
+        fi
+    else
+        die "cannot verify Cloudflare publication after an ambiguous PATCH response"
+    fi
 fi
 
 committed=true
+publication_uncertain=false
+unset cf_api_token
 printf 'ECH configuration published for %s\n' "${ECH_PUBLIC_NAME}"
