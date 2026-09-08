@@ -3,8 +3,6 @@
 
 ###############################################################################
 # Guided System Clone Script (Raspberry Pi and x86)
-# Version: 2.5.0
-# Updated: 2026-07-29
 #
 # Creates a bootable file-level clone of the running Linux system to an external
 # drive for supported layouts.
@@ -30,6 +28,22 @@
 #              command to exit with a non-zero status, or zero if all exit ok.
 set -Eeuo pipefail
 
+if [[ "${BASH_SOURCE[0]}" == "$0" && ("${1:-}" == --help || "${1:-}" == -h) ]]; then
+    cat <<'HELP'
+Usage: sudo ./clone_disk.sh
+Interactive file-level clone: ext4 root, one FAT boot partition, Raspberry Pi
+firmware or systemd-boot. Full mode wipes the confirmed destination; incremental
+mode updates an existing compatible clone. No unattended or dry-run mode.
+Dependencies: rsync, util-linux, parted, filesystem tools and GNU coreutils.
+HELP
+    exit 0
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]] && (($# != 0)); then
+    printf '%s\n' 'Unexpected arguments; see --help' >&2
+    exit 2
+fi
+
 ###################
 # Configuration
 ###################
@@ -53,7 +67,7 @@ declare -r INODE_RATIO="16384"
 declare -ra REQUIRED_COMMANDS=(
     awk basename blkid dd df dirname findmnt fsck fsck.fat fstrim grep lsblk
     mkdir mkfs.ext4 mkfs.vfat mktemp mkswap mount mountpoint mv numfmt partprobe
-    parted rm rsync sed sleep stat sync truncate udevadm umount wipefs
+    parted rm rmdir rsync sed sleep stat sync truncate udevadm umount wipefs
 )
 
 # Known boot mount points to validate against fstab (order = priority)
@@ -311,6 +325,19 @@ get_fstab_swap_files() {
             }
         }
     ' /etc/fstab
+}
+
+# Include the conventional swapfile even on hosts that manage it outside fstab.
+# Both sync filters and swap recreation use exactly the same source inventory.
+get_source_swap_files() {
+    local paths
+    # This helper returns errors explicitly to the enclosing decision.
+    # shellcheck disable=SC2310
+    paths=$(get_fstab_swap_files) || return
+    [[ -z "$paths" ]] || printf '%s\n' "$paths"
+    if [[ -f /swapfile && $'\n'"$paths"$'\n' != *$'\n/swapfile\n'* ]]; then
+        printf '/swapfile\n'
+    fi
 }
 
 # Read swap devices that cannot be safely recreated by this script.
@@ -640,26 +667,29 @@ check_space() {
     fi
 }
 
-# Safely unmount a path, retrying with lazy unmount if busy
+# Retry normal unmounts; an occupied mount must remain attached and visible.
 # Args: $1 - mount point
-# shellcheck disable=SC2329
 safe_unmount() {
     local mount_point="$1"
+    local attempt
     if mountpoint -q "$mount_point"; then
         sync || log "WARN" "sync failed before unmounting $mount_point."
-        if ! umount "$mount_point"; then
-            log "WARN" "Failed to unmount $mount_point, retrying with lazy unmount..."
-            umount -l "$mount_point" || log "ERROR" "Lazy unmount also failed for $mount_point."
-        fi
+        for attempt in 1 2 3; do
+            umount -- "$mount_point" && return 0
+            log "WARN" "Failed to unmount $mount_point (attempt $attempt/3)."
+            ((attempt == 3)) || sleep 2
+        done
+        log "ERROR" "Leaving busy filesystem mounted at $mount_point."
+        return 1
     fi
     return 0
 }
 
 # Cleanup function called on exit
 # Ensures temporary mount points are unmounted and removed
-# shellcheck disable=SC2329
 cleanup() {
     local saved_exit_code=$?
+    local idx unmount_failed=0
     if [[ -n "$DST_MOUNT_ROOT" ]]; then
         log "INFO" "Cleaning up..."
         # Optimize SSD before unmounting (only if DST_PART2 was set)
@@ -690,13 +720,19 @@ cleanup() {
         # Unmount in reverse order (LIFO) using the tracked array
         # This avoids hardcoded paths and "not mounted" warnings
         for ((idx = ${#MOUNTED_BY_SCRIPT[@]} - 1; idx >= 0; idx--)); do
-            safe_unmount "${MOUNTED_BY_SCRIPT[idx]}"
+            # This helper returns errors explicitly to the enclosing decision.
+            # shellcheck disable=SC2310
+            safe_unmount "${MOUNTED_BY_SCRIPT[idx]}" || unmount_failed=1
         done
 
-        if findmnt -R "$DST_MOUNT_ROOT" >/dev/null 2>&1; then
+        if ((unmount_failed != 0)) || findmnt -R "$DST_MOUNT_ROOT" >/dev/null 2>&1; then
             log "WARN" "Temporary mount root still contains mounted filesystems; leaving $DST_MOUNT_ROOT in place."
+            ((saved_exit_code != 0)) || saved_exit_code=1
         elif [[ -d "$DST_MOUNT_ROOT" ]]; then
-            rm -rf "$DST_MOUNT_ROOT" || log "WARN" "Failed to remove temporary mount root $DST_MOUNT_ROOT."
+            rmdir -- "$DST_MOUNT_ROOT" || {
+                log "WARN" "Failed to remove temporary mount root $DST_MOUNT_ROOT."
+                ((saved_exit_code != 0)) || saved_exit_code=1
+            }
         fi
     fi
     return "$saved_exit_code"
@@ -899,7 +935,10 @@ perform_incremental_update() {
     # if fstab changed on source or if we are fixing a broken backup.
     update_destination_config
 
-    # 5. Verify
+    # 5. Preserve valid swap files or recreate missing/resized ones.
+    recreate_swap
+
+    # 6. Verify
     verify_backup
 
     log "INFO" "Incremental update completed successfully."
@@ -962,6 +1001,16 @@ sync_data() {
 
     # Protect lost+found from deletion on destination
     rsync_args+=(--filter='protect /lost+found')
+
+    # Never copy active swap contents or delete the destination's valid swap.
+    local swap_paths swapfile
+    # This helper returns errors explicitly to the enclosing decision.
+    # shellcheck disable=SC2310
+    swap_paths=$(get_source_swap_files) || die "Failed to list source swap files"
+    while IFS= read -r swapfile; do
+        [[ -n "$swapfile" ]] || continue
+        rsync_args+=(--filter="protect ${swapfile}" --exclude="$swapfile")
+    done <<<"$swap_paths"
 
     # Dynamic exclude for boot partition (prevents error 23 on FAT32)
     # We exclude the mountpoint itself so rsync doesn't try to set permissions on it
@@ -1157,20 +1206,11 @@ recreate_swap() {
     fi
 
     local -a swapfiles=()
-    local swapfile existing duplicate
-    local swapfiles_file
-    swapfiles_file=$(mktemp)
-    get_fstab_swap_files >"$swapfiles_file"
-    mapfile -t swapfiles <"$swapfiles_file"
-    rm -f "$swapfiles_file"
-
-    if [[ -f /swapfile ]]; then
-        duplicate=false
-        for existing in "${swapfiles[@]}"; do
-            [[ "$existing" == "/swapfile" ]] && duplicate=true
-        done
-        [[ "$duplicate" == true ]] || swapfiles+=("/swapfile")
-    fi
+    local swapfile swap_paths
+    # This helper returns errors explicitly to the enclosing decision.
+    # shellcheck disable=SC2310
+    swap_paths=$(get_source_swap_files) || die "Failed to list source swap files"
+    [[ -z "$swap_paths" ]] || mapfile -t swapfiles <<<"$swap_paths"
 
     for swapfile in "${swapfiles[@]}"; do
         if [[ ! -f "$swapfile" ]]; then
@@ -1179,10 +1219,20 @@ recreate_swap() {
         fi
 
         log "INFO" "Detected swapfile $swapfile on source. Recreating on destination..."
-        local swap_size swap_size_human swap_parent
+        local swap_size swap_size_human swap_parent existing_size existing_type
         swap_size=$(stat -c %s "$swapfile")
         swap_size_human=$(numfmt --to=iec-i --suffix=B "$swap_size")
         swap_parent=$(dirname "$DST_MOUNT_ROOT$swapfile")
+
+        if [[ -f "$DST_MOUNT_ROOT$swapfile" && ! -L "$DST_MOUNT_ROOT$swapfile" ]]; then
+            existing_size=$(stat -c %s "$DST_MOUNT_ROOT$swapfile")
+            existing_type=$(blkid -p -s TYPE -o value "$DST_MOUNT_ROOT$swapfile" 2>/dev/null || true)
+            if [[ "$existing_size" == "$swap_size" && "$existing_type" == swap ]]; then
+                chmod 600 "$DST_MOUNT_ROOT$swapfile"
+                log "INFO" "Keeping valid destination swapfile $swapfile ($swap_size_human)."
+                continue
+            fi
+        fi
 
         mkdir -p "$swap_parent"
         rm -f "$DST_MOUNT_ROOT$swapfile"
@@ -1213,7 +1263,7 @@ recreate_swap() {
             mkswap "$DST_MOUNT_ROOT$swapfile" >/dev/null
             log "INFO" "Swapfile $swapfile recreated successfully ($swap_size_human)."
         else
-            log "WARN" "Failed to allocate swapfile $swapfile. Skipping."
+            die "Failed to allocate swapfile $swapfile."
         fi
     done
 }
@@ -1370,4 +1420,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

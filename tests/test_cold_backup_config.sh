@@ -22,6 +22,21 @@ COLD_BACKUP_ENV_FILE="${TEST_TMP}/cold_backup.env" \
     "${REPO_ROOT}/src/scripts/cold_backup.sh" --check-config |
     grep -Fx 'cold_backup configuration is valid' >/dev/null
 
+for assignment in \
+    'COLD_BACKUP_NVME_MOUNT=/' \
+    'COLD_BACKUP_NVME_MOUNT=relative' \
+    'COLD_BACKUP_NVME_MOUNT=/mnt/../' \
+    'COLD_BACKUP_NVME_BULK_DESTINATION=/../outside' \
+    'COLD_BACKUP_NVME_HOME_DESTINATION=relative'; do
+    cp -- "${TEST_TMP}/cold_backup.env" "${TEST_TMP}/invalid.env"
+    printf '%s\n' "${assignment}" >>"${TEST_TMP}/invalid.env"
+    if COLD_BACKUP_ENV_FILE="${TEST_TMP}/invalid.env" \
+        "${REPO_ROOT}/src/scripts/cold_backup.sh" --check-config >/dev/null 2>&1; then
+        printf 'unsafe backup path accepted: %s\n' "${assignment}" >&2
+        exit 1
+    fi
+done
+
 chmod 0666 "${TEST_TMP}/cold_backup.env"
 if COLD_BACKUP_ENV_FILE="${TEST_TMP}/cold_backup.env" \
     "${REPO_ROOT}/src/scripts/cold_backup.sh" --check-config 2>/dev/null; then

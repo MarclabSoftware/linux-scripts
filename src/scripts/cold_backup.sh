@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Cold Storage Backup Utility
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Synchronizes selected source directories to one or two removable backup
 # drives identified by filesystem UUID. Host-specific UUIDs, mount points and
@@ -14,6 +12,18 @@
 #   sudo COLD_BACKUP_ENV_FILE=/path/to/config.env ./cold_backup.sh
 
 set -Eeuo pipefail
+
+if [[ "${BASH_SOURCE[0]}" == "$0" && ("${1:-}" == --help || "${1:-}" == -h) ]]; then
+    cat <<'HELP'
+Usage: sudo ./cold_backup.sh [--force-nvme]
+       ./cold_backup.sh --dry-run [-n] [--force-nvme]
+       ./cold_backup.sh --check-config
+Configuration: cold_backup.env beside the script, or COLD_BACKUP_ENV_FILE.
+Dry run requires the intended source and destination filesystems already mounted;
+it does not create directories, acquire locks, mount, unmount or sync drives.
+HELP
+    exit 0
+fi
 IFS=$'\n\t'
 
 ###################
@@ -69,7 +79,7 @@ readonly SRC_HOME="${COLD_BACKUP_HOME_SOURCE:?COLD_BACKUP_HOME_SOURCE is require
 readonly LOCK_FILE="${COLD_BACKUP_LOCK_FILE:-/run/lock/cold_backup.lock}"
 
 # --- Dependencies ---
-readonly REQUIRED_COMMANDS=(rsync findmnt blkid mount umount sync flock pkill date mkdir sleep)
+readonly REQUIRED_COMMANDS=(rsync findmnt blkid realpath mount umount sync flock pkill date mkdir sleep)
 
 # --- Rsync Options ---
 # -rltD: Recursive, Links, Times, Devices (NO Perms/Owner/Group for NTFS)
@@ -77,6 +87,7 @@ readonly REQUIRED_COMMANDS=(rsync findmnt blkid mount umount sync flock pkill da
 # --numeric-ids: Don't map uid/gid values by user/group name
 # --stats: Give some file-transfer stats
 # --exclude: Skip Windows system folders
+DRY_RUN=false
 RSYNC_OPTS=(-rltDvh --info=progress2 --inplace --delete --modify-window=1 --numeric-ids --stats "--exclude=\$RECYCLE.BIN" "--exclude=System Volume Information")
 
 # Tracks backup drives to unmount during cleanup
@@ -94,23 +105,17 @@ log() {
 }
 
 # Cleanup function to unmount drives we mounted
-# shellcheck disable=SC2329
 cleanup() {
     local saved_exit_code=$?
     local mount_point
     local unmount_status
-    local attempt
+    local attempt idx
 
-    set +e
-
-    # Flush buffers before unmounting to ensure data safety
-    log "INFO" "Flushing buffers (sync)..."
-    sync
-
-    # Kill child processes (rsync) to release file handles
-    # Suppress errors if no children exist
+    # Stop any remaining child before flushing and detaching our mounts.
     pkill -P "${BASHPID}" >/dev/null 2>&1 || true
-    sleep 2
+    wait || true
+    log "INFO" "Flushing buffers (sync)..."
+    sync || saved_exit_code=1
 
     # Reverse order cleanup (LIFO)
     for ((idx = ${#MOUNT_POINTS_TO_UNMOUNT[@]} - 1; idx >= 0; idx--)); do
@@ -126,7 +131,7 @@ cleanup() {
                     break
                 fi
                 log "WARN" "Unmount failed for ${mount_point} (attempt ${attempt}/3). Retrying..."
-                sync
+                sync || saved_exit_code=1
                 sleep 2
             done
             if ((unmount_status != 0)); then
@@ -153,7 +158,9 @@ setup_signal_handlers() {
 
 check_dependencies() {
     local missing_commands=()
-    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+    local -a commands=("${REQUIRED_COMMANDS[@]}")
+    [[ "${DRY_RUN}" != true ]] || commands=(rsync findmnt blkid realpath)
+    for cmd in "${commands[@]}"; do
         command -v "${cmd}" >/dev/null 2>&1 || missing_commands+=("${cmd}")
     done
     [[ ${#missing_commands[@]} -eq 0 ]] || die "Missing commands: ${missing_commands[*]}"
@@ -162,36 +169,24 @@ check_dependencies() {
 # Mounts a drive if it is not already mounted
 # @param $1 UUID
 # @param $2 Mount Point
+# Called in checked contexts; each failure is returned explicitly.
 ensure_mounted() {
     local uuid="${1}"
     local mount_point="${2}"
-    local mount_fstype
     local mount_source
     local mounted_uuid
 
-    if findmnt -M "${mount_point}" >/dev/null; then
-        mount_fstype="$(findmnt -n -o FSTYPE -M "${mount_point}")"
-        if [[ "${mount_fstype}" == "autofs" ]]; then
-            log "INFO" "Automount found at ${mount_point}; activating real filesystem..."
-            if mount "${mount_point}"; then
-                log "INFO" "Mount successful."
-                MOUNT_POINTS_TO_UNMOUNT+=("${mount_point}")
-            else
-                log "ERROR" "Failed to mount ${mount_point}. Check fstab."
-                return 1
-            fi
-        else
-            log "INFO" "Drive (${uuid}) is already mounted at ${mount_point}."
-        fi
+    if findmnt --real -M "${mount_point}" >/dev/null; then
+        log "INFO" "Drive (${uuid}) is already mounted at ${mount_point}."
+    elif [[ "${DRY_RUN}" == true ]]; then
+        log "ERROR" "Dry-run requires an already mounted drive at ${mount_point}; no mount was attempted."
+        return 1
+    elif mount "${mount_point}"; then
+        MOUNT_POINTS_TO_UNMOUNT+=("${mount_point}")
+        log "INFO" "Mount successful."
     else
-        log "INFO" "Mounting drive (${uuid}) to ${mount_point}..."
-        if mount "${mount_point}"; then
-            log "INFO" "Mount successful."
-            MOUNT_POINTS_TO_UNMOUNT+=("${mount_point}")
-        else
-            log "ERROR" "Failed to mount ${mount_point}. Check fstab."
-            return 1
-        fi
+        log "ERROR" "Failed to mount ${mount_point}. Check fstab."
+        return 1
     fi
 
     if ! mounted_uuid="$(findmnt --real -n -o UUID -M "${mount_point}")"; then
@@ -223,27 +218,24 @@ ensure_mounted() {
 # @param $2 Mount Point
 # @param $3 Drive Label (for logging)
 # @param $4 Icon (optional, default 💾)
+# Called in checked contexts; each failure is returned explicitly.
 prepare_drive() {
     local uuid="${1}"
     local mount_point="${2}"
     local label="${3}"
     local icon="${4:-💾}"
-    local mount_status
 
     echo "---------------------------------------------------"
     log "INFO" "${icon} INITIALIZING ${label} BACKUP SEQUENCE"
     echo "---------------------------------------------------"
 
-    set +e
-    ensure_mounted "${uuid}" "${mount_point}"
-    mount_status=$?
-    set -e
-    if ((mount_status != 0)); then
+    # shellcheck disable=SC2310
+    if ! ensure_mounted "${uuid}" "${mount_point}"; then
         log "ERROR" "Skipping ${label} backup due to mount failure."
         return 1
     fi
 
-    if [[ ! -w "${mount_point}" ]]; then
+    if [[ "${DRY_RUN}" != true && ! -w "${mount_point}" ]]; then
         log "ERROR" "${label} mount point is read-only. Skipping."
         return 1
     fi
@@ -254,6 +246,7 @@ prepare_drive() {
 # @param $1 Source path
 # @param $2 Destination full path
 # @param $3 Description
+# Called in checked contexts; each failure is returned explicitly.
 run_rsync() {
     local src="${1}"
     local dest="${2}"
@@ -263,18 +256,20 @@ run_rsync() {
     log "INFO" "    Source: ${src}"
     log "INFO" "    Target: ${dest}"
 
-    if ! mkdir -p "${dest}"; then
-        log "ERROR" "Failed to create destination directory: ${dest}"
+    local source_path source_mount
+    source_path="$(realpath -ms -- "${src}")" || return
+    source_mount="$(realpath -ms -- "${SRC_DATA_MOUNT}")" || return
+    if [[ "${source_path}" == "${source_mount}" || "${source_path}" == "${source_mount%/}/"* ]] &&
+        ! findmnt --real -M "${SRC_DATA_MOUNT}" >/dev/null; then
+        log "ERROR" "Source mount is not mounted: ${SRC_DATA_MOUNT}. Refusing rsync --delete."
         return 1
     fi
-
     if [[ ! -d "${src}" ]]; then
         log "ERROR" "Source directory not found: ${src}"
         return 1
     fi
-
-    if [[ "${src}" == "${SRC_DATA_MOUNT}/"* ]] && ! findmnt -M "${SRC_DATA_MOUNT}" >/dev/null; then
-        log "ERROR" "Source mount is not mounted: ${SRC_DATA_MOUNT}. Refusing rsync --delete."
+    if [[ "${DRY_RUN}" != true ]] && ! mkdir -p -- "${dest}"; then
+        log "ERROR" "Failed to create destination directory: ${dest}"
         return 1
     fi
 
@@ -291,60 +286,28 @@ run_rsync() {
 # Backup Logic Blocks
 ###################
 
+# Called in checked contexts; each failure is returned explicitly.
 perform_nvme_backup() {
-    local step_status
-
-    set +e
-    prepare_drive "${UUID_NVME}" "${MOUNT_NVME}" "NVMe" "🚀"
-    step_status=$?
-    set -e
-    if ((step_status != 0)); then
-        return 1
-    fi
-
-    # Synchronize the source subset configured for the faster target.
-    set +e
-    run_rsync "${SRC_DATA_PARTIAL}" "${MOUNT_NVME}${DEST_NVME_BULK}" "NVMe: Bulk Data (Partial)"
-    step_status=$?
-    set -e
-    if ((step_status != 0)); then
-        return 1
-    fi
-
-    # Synchronize the configured home-data source.
-    set +e
-    run_rsync "${SRC_HOME}" "${MOUNT_NVME}${DEST_NVME_HOME}" "NVMe: Home Data"
-    step_status=$?
-    set -e
-    return "${step_status}"
+    local status=0
+    # shellcheck disable=SC2310
+    prepare_drive "${UUID_NVME}" "${MOUNT_NVME}" "NVMe" "🚀" || return
+    # shellcheck disable=SC2310
+    run_rsync "${SRC_DATA_PARTIAL}" "${MOUNT_NVME}${DEST_NVME_BULK}" "NVMe: Bulk Data" || status=1
+    # shellcheck disable=SC2310
+    run_rsync "${SRC_HOME}" "${MOUNT_NVME}${DEST_NVME_HOME}" "NVMe: Home Data" || status=1
+    return "${status}"
 }
 
+# Called in checked contexts; each failure is returned explicitly.
 perform_hdd_backup() {
-    local step_status
-
-    set +e
-    prepare_drive "${UUID_HDD}" "${MOUNT_HDD}" "HDD" "🐢"
-    step_status=$?
-    set -e
-    if ((step_status != 0)); then
-        return 1
-    fi
-
-    # Synchronize the full data source configured for the larger target.
-    set +e
-    run_rsync "${SRC_DATA_FULL}" "${MOUNT_HDD}${DEST_HDD_BULK}" "HDD: Bulk Data (Full)"
-    step_status=$?
-    set -e
-    if ((step_status != 0)); then
-        return 1
-    fi
-
-    # Synchronize the configured home-data source.
-    set +e
-    run_rsync "${SRC_HOME}" "${MOUNT_HDD}${DEST_HDD_HOME}" "HDD: Home Data"
-    step_status=$?
-    set -e
-    return "${step_status}"
+    local status=0
+    # shellcheck disable=SC2310
+    prepare_drive "${UUID_HDD}" "${MOUNT_HDD}" "HDD" "🐢" || return
+    # shellcheck disable=SC2310
+    run_rsync "${SRC_DATA_FULL}" "${MOUNT_HDD}${DEST_HDD_BULK}" "HDD: Bulk Data" || status=1
+    # shellcheck disable=SC2310
+    run_rsync "${SRC_HOME}" "${MOUNT_HDD}${DEST_HDD_HOME}" "HDD: Home Data" || status=1
+    return "${status}"
 }
 
 ###################
@@ -352,6 +315,26 @@ perform_hdd_backup() {
 ###################
 
 validate_configuration() {
+    local path
+    for path in "${SRC_DATA_MOUNT}" "${SRC_HOME}" "${LOCK_FILE}"; do
+        [[ "${path}" == /* && "${path}" != *[$'\r\n']* ]] ||
+            die "source and lock paths must be absolute single-line paths"
+    done
+    for path in "${MOUNT_NVME}" "${MOUNT_HDD}" "${SRC_DATA_PARTIAL}" "${SRC_DATA_FULL}"; do
+        [[ -z "${path}" || ("${path}" == /* && "${path}" != *[$'\r\n']*) ]] ||
+            die "backup mount and data paths must be absolute single-line paths"
+    done
+    for path in "${MOUNT_NVME}" "${MOUNT_HDD}"; do
+        [[ -z "${path}" ]] && continue
+        [[ "${path}" != / && "${path}" != *'/../'* && "${path}" != */.. &&
+            "${path}" != *'/./'* && "${path}" != */. && "${path}" != *'//'* ]] ||
+            die "backup mount must name a dedicated mount point without dot segments"
+    done
+    for path in "${DEST_NVME_BULK}" "${DEST_NVME_HOME}" "${DEST_HDD_BULK}" "${DEST_HDD_HOME}"; do
+        [[ "${path}" == /* && "${path}" != *[$'\r\n']* &&
+            "${path}" != *'/../'* && "${path}" != */.. ]] ||
+            die "destination suffix must stay below its backup mount (absolute, no parent traversal)"
+    done
     [[ -n "${UUID_NVME}" || -n "${UUID_HDD}" ]] ||
         die "configure at least one backup drive UUID"
     [[ -z "${UUID_NVME}" || -n "${MOUNT_NVME}" ]] ||
@@ -374,7 +357,6 @@ validate_configuration() {
 main() {
     local force_nvme=false
     local check_config=false
-    local backup_status
 
     # CLI flags deliberately override behavior, while paths stay in the sidecar.
     while [[ $# -gt 0 ]]; do
@@ -384,6 +366,7 @@ main() {
                 # Replace progress bar with itemize-changes (-i) for better visibility
                 RSYNC_OPTS=("${RSYNC_OPTS[@]/--info=progress2/-i}")
                 RSYNC_OPTS+=("--dry-run")
+                DRY_RUN=true
                 shift
                 ;;
             --force-nvme)
@@ -408,18 +391,16 @@ main() {
         exit 0
     fi
 
-    ((EUID == 0)) || die "Please run as root/sudo"
-    setup_signal_handlers
     check_dependencies
-
-    # Prevent multiple instances
-    # Using /var/lock/cold_backup.lock (FHS compliant)
-    exec 200>"${LOCK_FILE}" || die "Failed to acquire lock file descriptor."
-    # Wait 5 seconds for lock (-w 5) instead of failing immediately
-    flock -w 5 200 || die "Another instance is already running."
+    if [[ "${DRY_RUN}" != true ]]; then
+        ((EUID == 0)) || die "Please run as root/sudo"
+        setup_signal_handlers
+        exec 200>"${LOCK_FILE}" || die "Failed to acquire lock file descriptor."
+        flock -w 5 200 || die "Another instance is already running."
+    fi
 
     echo "==================================================="
-    echo "   COLD STORAGE BACKUP UTILITY v2.0.0"
+    echo "   COLD STORAGE BACKUP UTILITY"
     echo "==================================================="
 
     local nvme_found=false
@@ -448,13 +429,9 @@ main() {
         if [[ "${force_nvme}" == true && "${nvme_found}" == false ]]; then
             log "WARN" "Forcing NVMe backup even though UUID detection did not find it."
         fi
-        set +e
-        perform_nvme_backup
-        backup_status=$?
-        set -e
-        if ((backup_status != 0)); then
-            GLOBAL_EXIT_CODE=1
-        fi
+        # This helper returns errors explicitly to the enclosing decision.
+        # shellcheck disable=SC2310
+        perform_nvme_backup || GLOBAL_EXIT_CODE=1
     fi
 
     if [[ "${hdd_found}" == true ]]; then
@@ -462,13 +439,9 @@ main() {
         if [[ "${nvme_found}" == true ]]; then
             log "INFO" "NVMe backup finished. Proceeding to HDD backup..."
         fi
-        set +e
-        perform_hdd_backup
-        backup_status=$?
-        set -e
-        if ((backup_status != 0)); then
-            GLOBAL_EXIT_CODE=1
-        fi
+        # This helper returns errors explicitly to the enclosing decision.
+        # shellcheck disable=SC2310
+        perform_hdd_backup || GLOBAL_EXIT_CODE=1
     fi
 
     # 3. Finalization
@@ -483,5 +456,7 @@ main() {
     exit "${GLOBAL_EXIT_CODE}"
 }
 
-# Pass args mainly for potential future flags
-main "$@"
+# Run only when executed; tests may source the helpers with synthetic config.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
