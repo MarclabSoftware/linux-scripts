@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
 # Silicon Labs Zigbee Coordinator Firmware Updater
-# Version: 2.0.0
-# Updated: 2026-07-29
 #
 # Safely flashes supported Sonoff ZBDongle-E and Dongle Plus MG24 coordinators
 # with universal-silabs-flasher. The script can stop the matching Zigbee2MQTT
@@ -113,7 +111,6 @@ cleanup() {
     [[ "${rc}" == "0" || -z "${RUN_DIR}" ]] || warn "Logs and temporary files remain in: ${RUN_DIR}"
     exit "${rc}"
 }
-trap cleanup EXIT
 
 download() {
     local url="$1" dest="$2" min_bytes="$3" sha="${4:-}" tmp="${2}.part" size actual
@@ -134,16 +131,13 @@ download() {
 }
 
 find_device() {
-    local path lower
+    local lower glob_options
+    local -a paths=()
     CANDIDATES=()
-    add() {
-        for path in "${CANDIDATES[@]}"; do [[ "${path}" == "$1" ]] && return 0; done
-        CANDIDATES+=("$1")
-    }
 
     if [[ -n "${DEVICE}" ]]; then
         [[ -e "${DEVICE}" ]] || die "DEVICE does not exist: ${DEVICE}"
-        lower="$(printf '%s' "${DEVICE}" | tr '[:upper:]' '[:lower:]')"
+        lower="${DEVICE,,}"
         if [[ "${TARGET}" == "auto" && "${lower}" == *"mg24"* ]]; then TARGET="mg24"; fi
         if [[ "${TARGET}" == "auto" && "${lower}" == *"zbdongle"* ]]; then TARGET="zbdonglee"; fi
         if [[ "${TARGET}" == "auto" && "${lower}" == *"zigbee_3.0_usb_dongle_plus_v2"* ]]; then TARGET="zbdonglee"; fi
@@ -152,14 +146,17 @@ find_device() {
         return 0
     fi
 
+    glob_options="$(shopt -p nullglob nocaseglob || true)"
     shopt -s nullglob nocaseglob
     if [[ "${TARGET}" == "auto" || "${TARGET}" == "zbdonglee" ]]; then
-        for path in /dev/serial/by-id/usb-*Sonoff*Zigbee*3.0*USB*Dongle*Plus*V2* /dev/serial/by-id/usb-*ITEAD*SONOFF*Zigbee*3.0*USB*Dongle*Plus*V2*; do add "${path}"; done
+        paths+=(/dev/serial/by-id/usb-*Sonoff*Zigbee*3.0*USB*Dongle*Plus*V2*)
     fi
     if [[ "${TARGET}" == "auto" || "${TARGET}" == "mg24" ]]; then
-        for path in /dev/serial/by-id/usb-*SONOFF*Dongle*Plus*MG24* /dev/serial/by-id/usb-*Sonoff*Dongle*Plus*MG24*; do add "${path}"; done
+        paths+=(/dev/serial/by-id/usb-*SONOFF*Dongle*Plus*MG24*)
     fi
-    shopt -u nocaseglob
+    # Only shell-generated shopt commands are evaluated; no external text.
+    eval "${glob_options}"
+    CANDIDATES=("${paths[@]}")
 
     [[ "${#CANDIDATES[@]}" -gt 0 ]] ||
         die "no supported coordinator found; set DEVICE=/dev/... and TARGET=zbdonglee|mg24"
@@ -167,7 +164,7 @@ find_device() {
         die "multiple coordinator candidates found: ${CANDIDATES[*]}"
     DEVICE="${CANDIDATES[0]}"
 
-    lower="$(printf '%s' "${DEVICE}" | tr '[:upper:]' '[:lower:]')"
+    lower="${DEVICE,,}"
     [[ "${TARGET}" != "auto" || "${lower}" != *"mg24"* ]] || TARGET="mg24"
     [[ "${TARGET}" != "auto" || "${lower}" != *"zbdongle"* ]] || TARGET="zbdonglee"
     [[ "${TARGET}" != "auto" || "${lower}" != *"zigbee_3.0_usb_dongle_plus_v2"* ]] || TARGET="zbdonglee"
@@ -176,7 +173,7 @@ find_device() {
 }
 
 recovery_assets() {
-    local api mode json out rc app_asset nvm3_asset
+    local api mode json out app_asset nvm3_asset
     [[ "${RESET_MODE}" == "none" ]] && return 0
     need python3
 
@@ -203,10 +200,10 @@ recovery_assets() {
     log "Resolving recovery assets: ${RECOVERY_REPO} (${RECOVERY_RELEASE})"
     curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "${json}" "${api}"
 
-    set +e
-    out="$(
+    if ! out="$(
         python3 - "${json}" "${mode}" "${app_asset}" "${nvm3_asset}" <<'PY'
-import json, sys
+import json, re, sys
+from urllib.parse import urlsplit
 path, mode, app_name, nvm_name = sys.argv[1:5]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
@@ -221,16 +218,25 @@ def pick(name):
     digest = a.get("digest") or ""
     if digest.startswith("sha256:"):
         digest = digest.split(":", 1)[1]
-    return a["browser_download_url"], digest
+    if digest and not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+        raise SystemExit(f"unsupported digest for asset: {name}")
+    url = a["browser_download_url"]
+    endpoint = urlsplit(url)
+    if endpoint.scheme != "https" or not endpoint.hostname:
+        raise SystemExit(f"invalid download URL for asset: {name}")
+    return url, digest
 app_url, app_sha = pick(app_name)
 nvm_url, nvm_sha = pick(nvm_name)
-print("\t".join([rel.get("tag_name", ""), app_name, app_url, app_sha, nvm_name, nvm_url, nvm_sha]))
+fields = [rel.get("tag_name", ""), app_name, app_url, app_sha, nvm_name, nvm_url, nvm_sha]
+if any(not isinstance(field, str) or any(c in field for c in "|\r\n\0") for field in fields):
+    raise SystemExit("release fields contain unsupported delimiters")
+print("|".join(fields))
 PY
-    )"
-    rc=$?
-    set -e
-    [[ "${rc}" == "0" ]] || die "could not resolve recovery assets"
-    IFS=$'\t' read -r RECOVERY_TAG APP_ASSET APP_URL APP_SHA NVM3_ASSET NVM3_URL NVM3_SHA <<<"${out}"
+    )"; then
+        die "could not resolve recovery assets"
+    fi
+    # A non-whitespace separator preserves empty optional digest fields.
+    IFS='|' read -r RECOVERY_TAG APP_ASSET APP_URL APP_SHA NVM3_ASSET NVM3_URL NVM3_SHA <<<"${out}"
     log "Selected recovery release: ${RECOVERY_TAG}"
 }
 
@@ -238,10 +244,14 @@ flash() {
     local file="$1" label="$2" allow_clear_error="${3:-0}" rc
     local log_file="${RUN_DIR}/flash-${label}.log"
     FLASH_TOUCHED=1
-    set +e
-    "${SUDO[@]}" "${FLASHER[@]}" --device "${DEVICE}" --probe-methods "${PROBE_METHODS}" --bootloader-reset rts_dtr,baudrate flash --firmware "${file}" 2>&1 | tee "${log_file}"
-    rc=${PIPESTATUS[0]}
-    set -e
+    local -a pipeline_status
+    if "${SUDO[@]}" "${FLASHER[@]}" --device "${DEVICE}" --probe-methods "${PROBE_METHODS}" --bootloader-reset rts_dtr,baudrate flash --firmware "${file}" 2>&1 | tee "${log_file}"; then
+        return 0
+    else
+        pipeline_status=("${PIPESTATUS[@]}")
+    fi
+    ((pipeline_status[1] == 0)) || die "cannot save flash output: ${log_file}"
+    rc=${pipeline_status[0]}
     [[ "${rc}" == "0" ]] && return 0
     if [[ "${allow_clear_error}" == "1" ]] && grep -Eq 'NoFirmwareError|No firmware exists|No application can be launched' "${log_file}"; then
         warn "Application clear completed without bootable firmware; continuing with the final firmware."
@@ -251,13 +261,10 @@ flash() {
 }
 
 probe() {
-    local label="$1" rc
+    local label="$1"
     local log_file="${RUN_DIR}/probe-${label}.log"
-    set +e
+    # pipefail preserves failures from either the flasher or the output writer.
     "${SUDO[@]}" "${FLASHER[@]}" --device "${DEVICE}" --probe-methods "${PROBE_METHODS}" probe 2>&1 | tee "${log_file}"
-    rc=${PIPESTATUS[0]}
-    set -e
-    [[ "${rc}" == "0" ]]
 }
 
 validate_boolean() {
@@ -299,6 +306,12 @@ validate_config() {
     [[ "${STOP_Z2M}" == "0" || -n "${COMPOSE_PROJECT}" ]] ||
         die "COMPOSE_PROJECT must not be empty when STOP_Z2M=1"
 }
+
+# Loading helpers for isolated tests must not flash hardware or install traps.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+trap cleanup EXIT
 
 case "${1:-}" in
     --check-config)
@@ -396,7 +409,7 @@ if [[ "${STOP_Z2M}" == "1" ]]; then
     fi
 fi
 
-# probe() captures PIPESTATUS and deliberately returns it to this fallback.
+# probe() deliberately returns pipeline failure to this fallback.
 # shellcheck disable=SC2310
 probe before || warn "Initial probe failed; attempting bootloader-reset flashing anyway."
 case "${RESET_MODE}" in
