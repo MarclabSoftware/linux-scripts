@@ -20,7 +20,7 @@ configuration name. An account instance is not a path or arbitrary hostname.
 | `unbound_cache_dump@.service` + `.timer` | Writable `/var/lib/INSTANCE`, Unbound account and control socket |
 | `unbound_roothints@.service` + `.timer` | Root-hints helper at the exact libexec path below; Unbound config and control socket |
 | `kbd_backlight_off@.service` | Actual sysfs LED name as the escaped instance; no script |
-| `getty@.service.d/` | Getty drop-in only; retains the existing optional `setterm` powerdown behavior |
+| `getty@.service.d/` | Getty drop-in; applies console blanking and powerdown through optional `setterm` commands |
 
 `cert_monitor` reads its `.env` through `EnvironmentFile=`. Keep that file
 compatible with systemd's environment syntax. Other script-specific sidecars
@@ -30,8 +30,8 @@ also consumed as a systemd `EnvironmentFile=`.
 The templates use recent systemd sandboxing. The power-state retry settings
 require systemd 254 or newer
 ([upstream directive definition](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)).
-The Unbound CA helper uses `fast_reload`, introduced in
-[Unbound 1.23.0](https://www.nlnetlabs.nl/news/2025/Apr/24/unbound-1.23.0-released/).
+The Unbound CA helper requires `fast_reload` support
+([Unbound 1.23.0 or newer](https://www.nlnetlabs.nl/news/2025/Apr/24/unbound-1.23.0-released/)).
 That command needs a threaded build and has configuration limitations and extra
 temporary memory use; review the
 [Unbound control manual](https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html).
@@ -39,16 +39,18 @@ Check these features on the target before enabling the corresponding unit.
 
 ## Install and validate a selected pair
 
-From the repository root, an example for the webOS timer is:
+First install the component's script and configuration. In the following webOS
+example, replace `ACCOUNT` with the real account owning the scripts directory.
+Run the commands from the repository root:
 
 ```bash
 sudo install -m 0644 systemd/webos_devmode@.service systemd/webos_devmode@.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-systemd-analyze verify /etc/systemd/system/webos_devmode@.service /etc/systemd/system/webos_devmode@.timer
+systemd-analyze verify webos_devmode@ACCOUNT.service webos_devmode@ACCOUNT.timer
 ```
 
-First install its script/configuration and substitute the real account for
-`ACCOUNT`. A manual run performs the real operation:
+Validate the concrete instance so systemd checks its actual executable path.
+A manual run performs the real operation:
 
 ```bash
 sudo systemctl start webos_devmode@ACCOUNT.service
@@ -58,7 +60,7 @@ systemctl list-timers webos_devmode@ACCOUNT.timer
 ```
 
 Use the equivalent selected service/trigger for other components. Timers and
-paths already select their same-name service; do not add an unnecessary `Unit=`.
+paths select their same-name service; do not add an unnecessary `Unit=`.
 One-shot services can be inactive after successful completion; check their exit
 result and actual output. A loaded unit or an active timer does not prove that
 the underlying backup, DNS update or device action succeeded.
@@ -73,20 +75,21 @@ four hours). Missing required data prevents replacement of live rules.
 This deliberately does not persist firewall tables across reboots or promise
 protection before the first successful run. Keep the router/OCI access policy
 in force. Missing flowtable interfaces only disable offload; they do not block
-the base filter. For upgrades from iptables or generic NAT, follow the
-[firewall migration instructions](../src/scripts/README.md#firewall-updates).
+the base filter. See the [firewall guide](../src/scripts/README.md#firewall)
+for policy, cache handling, NAT and flow offload.
 
 ## Root-hints helper installation and recovery
 
-The root-hints unit now uses a separate executable so its update and rollback
-can be checked together. Install both the script and unit before enabling it:
+The root-hints unit invokes `unbound_update_root_hints.sh` to download, validate
+and publish hints, with rollback on failure. Install the helper and units before
+enabling the timer. This example uses the `unbound` instance:
 
 ```bash
 sudo install -d -m 0755 /usr/local/libexec/linux-scripts
 sudo install -m 0755 src/scripts/unbound_update_root_hints.sh /usr/local/libexec/linux-scripts/unbound_update_root_hints.sh
 sudo install -m 0644 systemd/unbound_roothints@.service systemd/unbound_roothints@.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-systemd-analyze verify /etc/systemd/system/unbound_roothints@.service
+systemd-analyze verify unbound_roothints@unbound.service unbound_roothints@unbound.timer
 ```
 
 For the normal `unbound` instance, the unit uses `/etc/unbound/root.hints`,

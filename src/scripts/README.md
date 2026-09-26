@@ -32,7 +32,7 @@ Docker access grants substantial control over the host even without UID 0.
 | Script or family | Main additional dependencies | Privilege / files needed |
 | --- | --- | --- |
 | `cert_monitor.sh` | OpenSSL, inotify-tools; systemd-notify under its unit | Certificate reader and PFX destination writer; `.env` is loaded by the unit |
-| `mtls_certificates.sh` | OpenSSL | Normal user; password files and private output directory; shared client identity remains intentional |
+| `mtls_certificates.sh` | OpenSSL | Normal user; password files and private output directory; one shared client identity |
 | `npm_cleaner.sh` | findutils | Certificate tree reader for preview, writer for deletion; `.env` |
 | `npmplus_ech_cloudflare.sh` | POSIX shell, curl, jq, OpenSSL, flock | NPMplus ECH hook; API token in an owner-only `.env` |
 | `docker_network.sh` | Docker CLI/daemon | Docker access; `.env`; verifies explicitly requested driver, IPv6 and IPAM settings |
@@ -79,7 +79,7 @@ from `.part` to its final owner-only `.tar.gz` name.
 directory creation or sync. Source and destination filesystems must already be
 mounted. Real runs validate the source mount before `--delete`; one failed drive
 does not prevent attempting the other. An occupied mount is left attached and
-reported as an error. The existing in-place rsync policy is a mirror operation,
+reported as an error. The in-place rsync policy is a mirror operation,
 not a snapshot transaction.
 
 `clone_disk.sh` supports ext4 root plus one FAT boot partition with Raspberry Pi
@@ -95,7 +95,7 @@ state when possible. Failed rollback retains the named transaction directory;
 do not remove it until the active data and container state have been verified.
 `--verify` does not require Docker or change the live data directory.
 
-## Firewall updates
+## Firewall
 
 ### Policy and scope
 
@@ -136,8 +136,8 @@ not reachability or the future kernel batch. The firewall sidecar owns countries
 IPv6 and list paths. It passes `-c`, `-6`, `-o` to the downloader, overriding
 its optional standalone defaults. Tune download concurrency/retries there only
 if needed. `DNS_SERVERS` optionally uses bounded `dig` queries; unresolved
-overrides fall back to the system resolver. No Google/GitHub connectivity probe
-is required before contacting the actual sources.
+overrides fall back to the system resolver. Downloads contact the configured
+sources directly, with bounded retries.
 
 HTTP success alone is insufficient: markup, address-free responses and partial
 downloads are rejected. Country data also rejects wrong-family entries and
@@ -150,6 +150,13 @@ oldest cache age. The firewall also reports resulting network counts and duratio
 There is intentionally no cache-age cutoff: operator-visible stale data is
 preferable to silently losing the policy.
 
+GeoIP IPv4 octets are normalized to decimal before publication, including
+cached lists and range endpoints. RIPE allocation counts become exact start/end
+ranges; iprange then converts them to CIDRs without assuming alignment or a
+power-of-two count. RIPE IPv4 cache files containing CIDRs are rejected.
+If neither a fresh download nor a valid cache is available, the run fails and
+active rules stay intact.
+
 The kernel update is one checked nft transaction. Cache directories use staged
 renames and rollback, **not** one atomic multi-directory transaction. If
 interrupted during replacement or rollback fails, the named `.ipblocker.*` or
@@ -159,11 +166,11 @@ recovery data blindly. Country data is replaceable, but restoring the previous
 cache should be an explicit operator action.
 
 The stable `IP_BLOCKER_LOCK_DIR/lock` uses `flock`; never unlink it while a
-run is active. A still-running old PID-lock version is rejected during migration.
-Do not launch the standalone downloader concurrently against the same output
-tree. The service does not wait for Docker or network-online; failed runs retry
-after 60 seconds. No tables are restored at reboot: router/OCI restrictions
-remain important until the first successful run. See the [unit guide](../../systemd/README.md).
+run is active. Do not launch the standalone downloader concurrently against the
+same output tree. The service does not wait for Docker or network-online;
+failed runs retry after 60 seconds. No tables are restored at reboot: router/OCI
+restrictions remain important until the first successful run. See the
+[unit guide](../../systemd/README.md).
 
 ### NAT and flow offload
 
@@ -187,28 +194,27 @@ are a snapshot at each run, not a dynamic Docker watcher. Route/interface change
 may require a refresh; do not assume an offload cache follows every topology
 change instantly. These limits follow the [kernel flowtable design](https://docs.kernel.org/networking/nf_flowtable.html).
 
-### Upgrade and verify
+### Install and verify
 
-Install both scripts together; a new parent requires downloader `-o` support.
-Keep existing sidecars and the native table name. Remove retired
-`IP_BLOCKER_IPTABLES_CHAIN_PREFIX`, `IP_BLOCKER_CONNECTIVITY_*` and
-`IP_BLOCKER_MAX_RETRIES` settings. A nonempty `IP_BLOCKER_NAT_INTERFACES` now
-fails validation: migrate any required NAT first, then remove it (empty/absent
-are accepted).
+Install `ip_blocker.sh` and `geo_ip_downloader.sh` in the same directory. Configure
+the firewall using [`ip_blocker.env.example`](ip_blocker.env.example), then run
+`ip_blocker.sh --check-config`. Preserve host-specific sidecars when replacing
+scripts. NAT is configured separately as described above.
 
-There is **no automatic iptables/ipset cleanup**. On an old-backend host, disable
-the old loader and remove only its verified objects in a controlled migration;
-do not flush Docker, Fail2ban or the whole firewall. Preserve an independent
-recovery connection and verify VPN exit routing before retiring old NAT.
+Keep an independent recovery connection available when applying the firewall.
+After a run, check its exit status and logs, inspect its nftables table and test
+new connections and any VPN exit routing. The script manages only its configured
+table; other firewall loaders and their rules require separate administration.
 
 Focused tests:
 
 ```bash
 (
     set -e
-    for part in config connectivity recovery safety input forwarding; do
+    for part in config connectivity recovery safety parser input forwarding; do
         bash "tests/test_firewall_${part}.sh"
     done
+    bash tests/test_geoip_lists.sh
     unshare -Urn bash tests/test_firewall_lock.sh
     bash tests/test_systemd_units.sh
 )
@@ -218,7 +224,8 @@ Failure-injection tests exercise caches, retries and rollback. Kernel tests use
 disposable network namespaces with synthetic interfaces, not real WireGuard
 encryption or production Docker. They check IPv4/IPv6, SSH saturation/expiry,
 NAT/source preservation, trusted offload, non-offloaded public bans and foreign
-table preservation. A passing suite is not a deployment or reboot test for A/B/C.
+table preservation. Verify actual service behavior on each deployment host,
+including after reboot.
 
 ## Media behavior
 

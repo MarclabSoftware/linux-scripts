@@ -39,7 +39,7 @@ nano src/init/init.env
 Before continuing:
 
 1. Replace `CONFIG_USER` with an existing, non-root account on the target.
-   Account creation deliberately remains an OS-installation task.
+   Create that account during OS installation.
 2. Read the comments beside every option you enable.
 3. Leave unused `CONFIG_INIT_*` switches set to `false`.
 4. Never put private SSH keys, passwords or tokens in this file.
@@ -167,8 +167,8 @@ their configured destination. Review both sections especially carefully.
 
 Repeated Docker, resolver, NTP and SSH configuration avoids unnecessary service
 reloads when the managed policy is unchanged. Validation still runs; an explicit
-SSH rotation request still rotates keys. Docker activation remains controlled
-by the existing provisioning switches.
+SSH rotation request rotates keys. Provisioning switches control Docker
+activation.
 
 ## Standalone scripts and systemd units
 
@@ -213,10 +213,10 @@ Private sidecars, generated artifacts, credentials and logs are excluded by
 | `webos_devmode.sh` | Renew LG webOS Developer Mode | `.env`, service, timer |
 | Console and keyboard-backlight units | Native console and LED controls | units only |
 | Unbound units | Cache dump, CA reload and root hints update | units; root hints also needs `unbound_update_root_hints.sh` |
-| `npm_cleaner.sh` | Clean legacy NPM certificate archives | `.env` |
+| `npm_cleaner.sh` | Clean Certbot CSR/key files and certificate archive versions | `.env`, dry run by default |
 | `argonone_install.sh`, `pigpiod_install.sh` | Hardware-specific installers | CLI |
 
-`media_common.sh` is a sourced library; every other file under `src/scripts/`
+`media_common.sh` is a sourced library; every other `.sh` file under `src/scripts/`
 is an executable entry point. `clone_disk.sh` is storage-layout-sensitive and
 must be reviewed before use on a different system.
 
@@ -288,6 +288,7 @@ temporary output on the destination filesystem; preserve recovery copies until
 the full operation succeeds. A failed recovery must name the retained files
 and return failure. Add a focused failure-injection check for these paths.
 
-Headers describe purpose, configuration and operational effects. Git records
-versions and dates; manually maintained per-file release numbers are omitted.
+Headers and READMEs describe current purpose, configuration and operational
+effects. Keep change history and migration narratives in Git, not in usage
+guides. Manually maintained per-file release numbers are omitted.
 Keep examples free of credentials and installation-specific private values.
