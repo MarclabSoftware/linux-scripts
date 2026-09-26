@@ -207,7 +207,7 @@ case "$1" in
                 main -c "${provider_family%:*}:IT" -6 "${provider_family#*:}" -o "${TEST_TMP}/${provider_family}"
             ) >"${TEST_TMP}/${provider_family}.log" 2>&1
             if [[ "${provider_family%:*}" == ripe ]]; then
-                grep -qxF '192.0.2.0/24' "${TEST_TMP}/${provider_family}/v4/it.ripe.list.v4"
+                grep -qxF '192.0.2.0 - 192.0.2.255' "${TEST_TMP}/${provider_family}/v4/it.ripe.list.v4"
             else
                 grep -qxF '192.0.2.0 - 192.0.2.255' "${TEST_TMP}/${provider_family}/v4/it.nirsoft.list.v4"
             fi

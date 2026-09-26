@@ -446,6 +446,7 @@ download_file() {
 #   1 => invalid / mixed / empty
 #   2 => dangerous catch-all entry
 # Optional $2: expected family (v4/v6); validate cache and fresh data identically.
+# Optional $3: staging output for canonical addresses; discard it on failure.
 # This function is a predicate and checks each fallible operation explicitly.
 validate_generated_list_file() {
     local list_file="$1"
@@ -472,6 +473,13 @@ validate_generated_list_file() {
                 if (parts[i] !~ /^[0-9]+$/ || parts[i] + 0 > 255) return 0
             }
             return 1
+        }
+        function decimal_ipv4(addr, parts, octets, count, result) {
+            count = split(addr, parts, "/")
+            split(parts[1], octets, ".")
+            result = sprintf("%d.%d.%d.%d", octets[1] + 0, octets[2] + 0,
+                             octets[3] + 0, octets[4] + 0)
+            return result (count == 2 ? "/" (parts[2] + 0) : "")
         }
         function is_valid_hex_group(group) {
             return (group ~ /^[0-9A-Fa-f]+$/ && length(group) <= 4)
@@ -546,10 +554,24 @@ validate_generated_list_file() {
 
             if (is_valid_ipv4($0) || is_valid_ipv4_range($0)) {
                 if (family == "v6") invalid = 1
+                if (index($0, "-")) {
+                    split($0, endpoints, /[[:space:]]+-[[:space:]]+/)
+                    print decimal_ipv4(endpoints[1]) " - " decimal_ipv4(endpoints[2])
+                } else {
+                    canonical = decimal_ipv4($0)
+                    if (canonical == "0.0.0.0") dangerous = 1
+                    print canonical
+                }
                 valid++; next
             }
             if (is_valid_ipv6($0)) {
                 if (family == "v4") invalid = 1
+                # A dotted IPv4 tail must also be decimal before iprange sees it.
+                if (index($0, ".")) {
+                    match($0, /[^:]+$/)
+                    $0 = substr($0, 1, RSTART - 1) decimal_ipv4(substr($0, RSTART))
+                }
+                print
                 valid++; next
             }
 
@@ -559,7 +581,7 @@ validate_generated_list_file() {
             if (dangerous) exit 2
             if (!saw_data || invalid || valid == 0) exit 1
         }
-    ' "${list_file}"; then
+    ' "${list_file}" >"${3:-/dev/null}"; then
         :
     else
         validation_rc=$?
@@ -581,8 +603,9 @@ validate_and_move_generated_file() {
     local validation_rc=0
 
     # shellcheck disable=SC2310
-    if validate_generated_list_file "${temp_file}" "${final_file##*.}"; then
-        mv -- "${temp_file}" "${final_file}" || return
+    if validate_generated_list_file "${temp_file}" "${final_file##*.}" "${temp_file}.normalized"; then
+        mv -- "${temp_file}.normalized" "${final_file}" || return
+        rm -f -- "${temp_file}" || return
         log "INFO" "Successfully processed generated ${list_name} list."
         return
     else
@@ -593,7 +616,7 @@ validate_and_move_generated_file() {
         2) log "ERROR" "DANGEROUS entry found in generated ${list_name} list. DISCARDING." ;;
         *) log "WARN" "Generated ${list_name} list contains invalid, empty, or mixed content. Ignoring." ;;
     esac
-    rm -f "${temp_file}"
+    rm -f -- "${temp_file}" "${temp_file}.normalized"
 }
 
 # Restores missing staged lists from the previous successful cache, list by list.
@@ -626,9 +649,17 @@ restore_missing_expected_lists() {
         fi
 
         cached_file="${allow_dir}/${basename}"
+        # Old RIPE IPv4 CIDRs lost allocation boundaries; only a fresh download
+        # can repair them. New RIPE output always contains explicit ranges.
+        if [[ "${family}" == v4 && "${basename}" == *.ripe.list.v4 && -f "${cached_file}" ]] &&
+            grep -q / "${cached_file}"; then
+            log "WARN" "Legacy RIPE cache requires a fresh download: ${basename}"
+            MISSING_EXPECTED_FILES+=("${family}:${basename}")
+            continue
+        fi
         # shellcheck disable=SC2310
-        if validate_generated_list_file "${cached_file}" "${family}"; then
-            cp --preserve=timestamps -f -- "${cached_file}" "${staging_file}" || die "Failed to restore cached list '${basename}'"
+        if validate_generated_list_file "${cached_file}" "${family}" "${staging_file}"; then
+            touch -r "${cached_file}" -- "${staging_file}" || die "Failed to preserve cache age for '${basename}'"
             CACHED_LISTS=$((CACHED_LISTS + 1))
             cache_time=$(stat -c %Y -- "${cached_file}") || die "Cannot read cache age"
             if ((OLDEST_CACHE == 0 || cache_time < OLDEST_CACHE)); then
@@ -638,6 +669,7 @@ restore_missing_expected_lists() {
             continue
         fi
 
+        rm -f -- "${staging_file}" || die "Failed to discard invalid staged cache '${basename}'"
         MISSING_EXPECTED_FILES+=("${family}:${basename}")
     done
 }
@@ -851,9 +883,9 @@ download_provider_ripe() {
 
     # 4. Run AWK once
     # This AWK script performs a single-pass scan of the massive RIPE database.
-    # It filters entries by country and status, calculates CIDR prefixes for IPv4,
+    # It filters entries by country and status, calculates exact IPv4 ranges,
     # and writes directly to the appropriate country/protocol files.
-    awk -v want_v6="${REQUIRE_IPV6_LISTS}" '
+    if ! awk -v want_v6="${REQUIRE_IPV6_LISTS}" '
         BEGIN {
             # Parse the targets map passed via environment variable.
             # Format: "IT<TAB>/path/to/v4<TAB>/path/to/v6"
@@ -870,12 +902,18 @@ download_provider_ripe() {
             FS = "|"
         }
 
-        # Calculates CIDR mask from a host count (IPv4 only).
-        # RIPE DB gives a number of hosts (e.g., 1024), we need the prefix length (e.g., /22).
-        # Formula: 32 - log2(hosts)
-        function calculate_v4_cidr(hosts) {
-            if (hosts == 0) return 32
-            return 32 - (log(hosts)/log(2))
+        function ipv4_number(addr, octets, i, value) {
+            if (split(addr, octets, ".") != 4) return -1
+            value = 0
+            for (i = 1; i <= 4; i++) {
+                if (octets[i] !~ /^[0-9]+$/ || octets[i] + 0 > 255) return -1
+                value = value * 256 + octets[i]
+            }
+            return value
+        }
+        function ipv4_text(value) {
+            return sprintf("%d.%d.%d.%d", int(value / 16777216),
+                           int(value / 65536) % 256, int(value / 256) % 256, value % 256)
         }
 
         # Main Loop: Process each line of the RIPE DB
@@ -888,15 +926,20 @@ download_provider_ripe() {
 
         ($2 in target_countries && ($7 == "allocated" || $7 == "assigned")) {
             if ($3 == "ipv4") {
-                # IPv4: Convert host count to CIDR and append to the countrys v4 file
-                printf "%s/%d\n", $4, calculate_v4_cidr($5) >> file_map_v4[$2]
+                # Counts need not be powers of two, nor starts CIDR-aligned.
+                start = ipv4_number($4)
+                if (start < 0 || $5 !~ /^[0-9]+$/ || $5 + 0 < 1 ||
+                    $5 + 0 > 4294967296 - start) exit 1
+                printf "%s - %s\n", ipv4_text(start), ipv4_text(start + $5 - 1) >> file_map_v4[$2]
             }
             else if ($3 == "ipv6" && want_v6 == "true") {
                 # IPv6: Already in CIDR format (Start/Prefix), just append
                 printf "%s/%s\n", $4, $5 >> file_map_v6[$2]
             }
         }
-    ' "${ripe_data_file}"
+    ' "${ripe_data_file}"; then
+        die "Invalid RIPE IPv4 allocation; generated lists were not published"
+    fi
 
     unset AWK_TARGETS
 
