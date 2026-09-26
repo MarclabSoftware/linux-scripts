@@ -938,6 +938,13 @@ split_ip_families_from_file() {
             }
             return 1
         }
+        function decimal_ipv4(addr, parts, octets, count, result) {
+            count = split(addr, parts, "/")
+            split(parts[1], octets, ".")
+            result = sprintf("%d.%d.%d.%d", octets[1] + 0, octets[2] + 0,
+                             octets[3] + 0, octets[4] + 0)
+            return result (count == 2 ? "/" (parts[2] + 0) : "")
+        }
         function is_valid_hex_group(group) {
             return (group ~ /^[0-9A-Fa-f]+$/ && length(group) <= 4)
         }
@@ -999,9 +1006,14 @@ split_ip_families_from_file() {
             if ($0 == "") next
 
             if (is_valid_ipv4($0) || is_valid_ipv4_range($0)) {
-                # Keep one canonical range format for downstream iprange consumers.
-                gsub(/[[:space:]]*-[[:space:]]*/, " - ", $0)
-                print >> out_v4
+                # iprange treats leading zeros as octal; emit decimal octets
+                # for individual addresses, CIDRs and both range endpoints.
+                if (index($0, "-")) {
+                    split($0, endpoints, /[[:space:]]*-[[:space:]]*/)
+                    print decimal_ipv4(endpoints[1]) " - " decimal_ipv4(endpoints[2]) >> out_v4
+                } else {
+                    print decimal_ipv4($0) >> out_v4
+                }
                 valid++
                 next
             }
